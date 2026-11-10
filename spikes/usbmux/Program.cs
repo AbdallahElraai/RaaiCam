@@ -29,7 +29,8 @@ static async Task<Dictionary<string, object>> RequestAsync(NetworkStream s, uint
     await s.WriteAsync(pkt);
     var header = new byte[16];
     await s.ReadExactlyAsync(header);
-    var total = (int)BinaryPrimitives.ReadUInt32LittleEndian(header);
+    var total = BinaryPrimitives.ReadUInt32LittleEndian(header);
+    if (total < 16 || total > 1_048_576) throw new InvalidDataException($"Bad usbmux packet length {total}.");
     var full = new byte[total];
     header.CopyTo(full, 0);
     await s.ReadExactlyAsync(full.AsMemory(16));
@@ -43,6 +44,8 @@ if (listConn == null)
     Console.WriteLine("Apple Mobile Device Service not reachable. Install the Apple Devices app.");
     return 1;
 }
+try
+{
 var reply = await RequestAsync(listConn.GetStream(), 1, UsbmuxProtocol.ListDevicesRequest());
 var devices = (reply.TryGetValue("DeviceList", out var dl) ? (List<object>)dl : new()).Cast<Dictionary<string, object>>().ToList();
 if (devices.Count == 0) { Console.WriteLine("No devices attached."); return 3; }
@@ -74,9 +77,10 @@ if (res != UsbmuxResult.Ok) { Console.WriteLine($"Connect failed: {res}"); retur
 // 3. Read [u32 BE length][JPEG].
 var lenBuf = new byte[4];
 await ts.ReadExactlyAsync(lenBuf);
-var len = (int)BinaryPrimitives.ReadUInt32BigEndian(lenBuf);
+var len = (long)BinaryPrimitives.ReadUInt32BigEndian(lenBuf);
+if (len > 32 * 1024 * 1024) throw new InvalidDataException($"Frame length {len} exceeds 32 MB.");
 if (len == 0) { Console.WriteLine("Phone has no frame yet (length 0)."); return 4; }
-var jpeg = new byte[len];
+var jpeg = new byte[(int)len];
 await ts.ReadExactlyAsync(jpeg);
 sw.Stop();
 
@@ -84,3 +88,9 @@ Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
 await File.WriteAllBytesAsync(outPath, jpeg);
 Console.WriteLine($"Saved {len} bytes to {outPath} in {sw.ElapsedMilliseconds} ms (connect + fetch).");
 return 0;
+}
+catch (Exception ex) when (ex is IOException or EndOfStreamException or InvalidDataException or InvalidCastException)
+{
+    Console.WriteLine($"Protocol/connection error: {ex.GetType().Name}: {ex.Message}");
+    return 3;
+}
