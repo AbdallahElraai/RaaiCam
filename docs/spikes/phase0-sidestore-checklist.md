@@ -51,3 +51,5 @@ Sources: [SideStore install guide](https://docs.sidestore.io/docs/installation/i
 | D2 Still listening after screen lock | |
 | D3 Refresh worked without the PC | |
 | Anything confusing or broken | |
+
+**Security:** the spike app serves camera frames unauthenticated on port 47820 to anyone on the same Wi-Fi. Delete RaaiCam Spike from the phone when done testing, or open it only on your home network.

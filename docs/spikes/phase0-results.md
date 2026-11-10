@@ -15,8 +15,8 @@ Recorded 2026-11-10 on the owner's PC (Windows 11 build 26200). Verdict: **feasi
 
 ### Shared memory namespace and DACL
 
-- `CreateFileMappingW("Global\RaaiCamSpikeFrames")` and `CreateEventW("Global\RaaiCamSpikeFrameReady")` **succeeded on the first try from inside Frame Server** (no Win32 error; the `Local\` fallback was never needed). LocalService holds `SeCreateGlobalPrivilege`.
-- DACL from SDDL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)` worked: the writer, as the interactive user, opened both objects by their `Global\` names with read/write access. No errors were seen.
+- `CreateFileMappingW("Global\RaaiCamSpikeFrames")` and `CreateEventW("Global\RaaiCamSpikeFrameReady")` **succeeded from inside Frame Server** (no Win32 error; the `Local\` fallback was never needed). LocalService holds `SeCreateGlobalPrivilege`.
+- DACL from SDDL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)` worked (spike only, see D17; it grants every interactive user full control): the writer, as the interactive user, opened both objects by their `Global\` names with read/write access. No errors were seen.
 - Note: in session 0, `Local\` and `Global\` resolve to the same namespace, so the fallback would also have been reachable from the user session as `Global\`.
 
 ### Registration
@@ -52,16 +52,34 @@ The probe's saved frames are `spikes/out/*.bmp` (gitignored). They were inspecte
 
 ### Build and run commands
 
-See `.superpowers/sdd/2026-11-10-phase0-feasibility-spike/task-2-report.md` for the full list. In short:
+The working invocation (`build.ps1` sets the SDK env, enters the VS dev shell, then runs CMake with the NMake generator; the first configure needs network once to clone WIL; MSVC 19.51, 0 warnings, 0 errors):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File spikes\vcam\build.ps1           # DLL, registrar, probe (NMake, Release)
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\RaaiCam\spikes\vcam\build.ps1   # DLL, registrar, probe -> spikes\vcam\build\bin\
+# inside build.ps1:
+#   $env:WindowsSdkDir = 'D:\WindowsKits\'; $env:WindowsSDKVersion = '10.0.26100.0\'
+#   Launch-VsDevShell.ps1 -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+#   cmake -S spikes\vcam -B spikes\vcam\build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+#   cmake --build spikes\vcam\build
 dotnet build spikes\framewriter -c Release                                # FrameWriter.dll
 # once, elevated (UAC): HKLM COM registration
 Start-Process regsvr32 -ArgumentList '/s','"D:\RaaiCam\spikes\vcam\build\bin\RaaiCamVCam.dll"' -Verb RunAs -Wait
 spikes\vcam\build\bin\registrar.exe                                       # keep open; Enter removes the camera
 dotnet spikes\framewriter\bin\Release\net10.0-windows\FrameWriter.dll     # color bars; Ctrl+C stops
 ```
+
+### Cleanup / unregister
+
+**Security: do this after the spike.** The spike DLL was registered in HKLM (elevated `regsvr32`) pointing at `D:\RaaiCam\spikes\vcam\build\bin\RaaiCamVCam.dll`. That folder is writable by Authenticated Users, so any local user could replace the DLL and have Frame Server (LocalService) load it. The owner should run both steps once testing is finished:
+
+```powershell
+# 1. elevated PowerShell: remove the HKLM COM registration
+regsvr32 /u /s "D:\RaaiCam\spikes\vcam\build\bin\RaaiCamVCam.dll"
+# 2. normal shell: remove any HKCU registration
+spikes\vcam\build\bin\registrar.exe --unregister-dll
+```
+
+Re-registering (the `regsvr32` line above without `/u`) is only for re-testing; unregister again afterwards.
 
 ### Step 7 — owner app checks
 
@@ -104,10 +122,12 @@ Device: iPhone 11 family (A13), iOS 26.6.2. Apple Devices (Microsoft Store) prov
 |---|---|
 | usbmux `Connect` to lockdownd 62078 | Result 0 |
 | usbmux `Connect` to the app's 47820, app using `NWListener` | **Result 3 (refused)**. Wi-Fi to the same listener worked |
-| Wi-Fi TCP 192.168.1.20:47820 | Connected, 80,095-byte 1920x1080 JPEG (black frame, lens likely covered, so this proves transport only) |
+| Wi-Fi TCP `<phone LAN IP>`:47820 | Connected, 80,095-byte 1920x1080 JPEG (black frame; proves transport only) |
 | usbmux to 47820 after replacing `NWListener` with a POSIX socket bound to INADDR_ANY | OK: 428,802-byte 1920x1080 JPEG in **66 ms** (connect + fetch) |
 
 `NWListener` is not reachable through usbmux. A BSD socket bound to INADDR_ANY works for both USB and Wi-Fi.
+
+**Security: the spike app serves camera frames unauthenticated on INADDR_ANY:47820 to anyone on the same Wi-Fi.** Delete RaaiCam Spike from the phone when done testing, or open it only on your home network.
 
 ## Environment notes
 
@@ -118,16 +138,25 @@ Device: iPhone 11 family (A13), iOS 26.6.2. Apple Devices (Microsoft Store) prov
 
 | # | Decision | Evidence |
 |---|---|---|
-| D17 | Shared memory and event use the `Global\` namespace, DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`. Created by the DLL inside Frame Server, opened by the user-mode writer. | Virtual camera section |
+| D17 | Global\ + an explicit DACL works; the spike DACL is NOT the production DACL. The spike used `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`, which gives every interactive user full control. Phase 1 must grant only SYSTEM, LocalService and the logged-on user's SID, with GR|GW rights rather than GA. Created by the DLL inside Frame Server, opened by the user-mode writer. | Virtual camera section |
 | D18 | DirectShow fallback **not needed**: Chrome, Edge, Zoom, Google Meet and Discord all show the camera. | Step 7 table |
 | D19 | iOS pipeline confirmed: GitHub Actions `macos-15` + XcodeGen builds an unsigned .ipa. The first CI run was green; later runs rebuilt for code changes (incl. the NWListener→BSD fix). | iOS build pipeline |
 | D20 | Install route: iloader (Windows, free Apple ID) "Import IPA", re-install from the PC every 7 days. SideStore PC-free refresh is blocked by the upstream -80045 bug; revisit later. | Install route |
 | D21 | USB tunnel confirmed: Apple Devices usbmuxd on 127.0.0.1:27015, 66 ms for a 1080p JPEG. Needs the Apple Devices app run once. | USB tunnel |
-| D22 | The iOS listener must be a **POSIX/BSD socket** on INADDR_ANY, not `NWListener`. | USB tunnel |
+| D22 | The iOS listener must be a **POSIX/BSD socket** on INADDR_ANY, not `NWListener`. Any listener reachable over Wi-Fi must authenticate (pairing key) before sending video. A loopback-only USB listener is an option, but it is untested. | USB tunnel |
 
 ## Implications for Phase 1
 
 - Virtual camera: double buffering or a sequence lock (tearing); timer-driven frame delivery instead of sleeping in `RequestSample`; the installer does the one-time elevated HKLM registration; Frame Server holds the DLL 35-50 s after use, so updates and rebuilds must handle the locked file.
+- Security, DLL location: install the virtual-camera DLL only to an admin-only-writable location (e.g. `%ProgramFiles%\RaaiCam`), never a user-writable folder. Frame Server (LocalService) loads it.
+- Security, shared memory DACL: the spike DACL (GA for SYSTEM, LocalService and all interactive users) is not for production. Grant only SYSTEM, LocalService and the logged-on user's SID, with GR|GW rights rather than GA, so another logged-on user cannot read or inject meeting video.
+- Security, network: any listener reachable over Wi-Fi must authenticate (pairing key) before sending video. A loopback-only USB listener is an option, but it is untested.
+- Spike code not to copy: `DllMain` calls `GetUserNameW` and does file I/O under the loader lock.
+- If the mapping comes up late, the header is never published and the stream stays stuck on the pattern.
+- A `GetFrame` failure drops the request without queueing an error event.
+- The `FrameSource` singleton is shared across streams.
+- Reads from the writer-controlled header should be copied once through volatile reads, then validated.
+- The DLL stays locked for about 35-50 s after use (see above).
 - A second consumer fails cleanly, so the app can show an "in use" state instead of hanging.
 - iOS: BSD-socket listener; Bonjour can be advertised separately.
 - Check free space on C: before installing anything large.

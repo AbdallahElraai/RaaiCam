@@ -65,12 +65,12 @@ Apple's Continuity Camera (Center Stage, Portrait, Desk View) only works on Mac.
 | D14 | Windows app autostarts in the tray | Always ready |
 | D15 | Phase 0 feasibility spike before real build | Zoom + MF virtual camera compatibility is unconfirmed |
 | D16 | Eye contact = v3 experimental | No RTX; open-source models are lower quality |
-| D17 | Virtual-camera shared memory and frame event use the `Global\` namespace with DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`; created by the DLL inside Frame Server | Phase 0: confirmed working; user-mode writer opens both by name |
+| D17 | Global\ + an explicit DACL works; the spike DACL is NOT the production DACL. The spike used `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`, which gives every interactive user full control. Phase 1 must grant only SYSTEM, LocalService and the logged-on user's SID, with GR|GW rights rather than GA. Created by the DLL inside Frame Server. | Phase 0: confirmed working; user-mode writer opens both by name |
 | D18 | No DirectShow fallback in v1 (FR-VC-5 dropped) | Phase 0: Chrome, Edge, Zoom, Google Meet and Discord all show the MF virtual camera |
 | D19 | iOS build pipeline: GitHub Actions `macos-15` + XcodeGen, unsigned .ipa | Phase 0: first CI run was green; later runs rebuilt for code changes (incl. the NWListener→BSD fix) |
 | D20 | Install route: iloader (Windows) "Import IPA" with a free Apple ID, re-install from the PC every 7 days. SideStore PC-free refresh deferred | SideStore on-device sign-in fails with -80045 (upstream issues #1709, #1652); PC-free refresh not verified |
 | D21 | USB tunnel: Apple Devices app provides usbmuxd on 127.0.0.1:27015; app port 47820 reachable over it | Phase 0: 1080p JPEG fetched in 66 ms (connect + fetch) on iPhone 11 family, iOS 26.6.2 |
-| D22 | The iOS listener is a POSIX/BSD socket bound to INADDR_ANY, **not** `NWListener` | Phase 0: usbmux `Connect` to an `NWListener` port returns Result 3 (refused), Wi-Fi works; BSD socket works on both |
+| D22 | The iOS listener is a POSIX/BSD socket bound to INADDR_ANY, **not** `NWListener`. Any listener reachable over Wi-Fi must authenticate (pairing key) before sending video. A loopback-only USB listener is an option, but it is untested. | Phase 0: usbmux `Connect` to an `NWListener` port returns Result 3 (refused), Wi-Fi works; BSD socket works on both |
 
 ---
 
@@ -295,7 +295,7 @@ D:\RaaiCam
 - **Min iOS:** 17.0 (iPhone 11/12 support newer). No third-party dependencies.
 
 ### 9.3 Windows app
-- **Runtime:** .NET 10, WinUI 3 (Windows App SDK), unpackaged with an installer (Inno Setup or MSIX sideload) that registers the virtual camera DLL under a location readable by Frame Server services. Registration is a one-time elevated step: HKCU-only COM registration fails (`IMFVirtualCamera::Start` returns 0x80070003), so the installer runs `regsvr32` into HKLM. Frame Server keeps the DLL loaded for about 35-50 s after use, so updates must wait for it or restart the service.
+- **Runtime:** .NET 10, WinUI 3 (Windows App SDK), unpackaged with an installer (Inno Setup or MSIX sideload) that installs the virtual-camera DLL only to an admin-only-writable location (e.g. `%ProgramFiles%\RaaiCam`), never a user-writable folder, because Frame Server (LocalService) loads it, and registers it. Registration is a one-time elevated step: HKCU-only COM registration fails (`IMFVirtualCamera::Start` returns 0x80070003), so the installer runs `regsvr32` into HKLM. Frame Server keeps the DLL loaded for about 35-50 s after use, so updates must wait for it or restart the service.
 - **Tray:** H.NotifyIcon.WinUI (or equivalent); single-instance; autostart via Startup task/registry Run key.
 - **Connection manager (RaaiCam.Core):**
   - `UsbmuxClient`: speaks usbmux plist protocol over TCP 127.0.0.1:27015 (`Listen` for attach/detach, `Connect` to device port 47820).
@@ -304,7 +304,7 @@ D:\RaaiCam
   - `Session`: pairing/auth, crypto (X25519 + HKDF + AES-256-GCM via .NET `System.Security.Cryptography`), command/telemetry dispatch.
 - **Media pipeline (RaaiCam.Media):** Media Foundation H.264 decoder with D3D11 device manager (NVDEC on NVIDIA) → NV12 `ID3D11Texture2D` → convert to RGB → Vision passes → compositing compute shaders (crop/scale with Lanczos/bicubic, blur, look/LUT, overlays) → NV12 → write to shared memory for the virtual camera and to the panel preview (SwapChainPanel). C# D3D11 interop via Vortice.Windows.
 - **Vision (RaaiCam.Vision):** ONNX Runtime + DirectML EP sharing the D3D12/DX device where possible (fallback: CPU copy at low res). Face detector at ~320 px every frame (or every 2nd frame + tracking); segmentation at 256–512 px; framing controller (pure C#, unit-tested).
-- **Virtual camera (RaaiCam.VirtualCam, C++):** `IMFMediaSource` + stream implementation per Microsoft VCamSample pattern; registration via `MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_CurrentUser, ...)`. Reads frames from a named shared-memory ring buffer (`Global\` naming with DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`, confirmed in Phase 0, D17) with a header (frame counter, timestamp, width, height, format, state). Writes "consumer active + client process" back to the header. Phase 0 found: a single unlocked buffer tears, so use double buffering or a sequence lock; pace output with timer-driven delivery rather than sleeping in `RequestSample`; a second simultaneous consumer gets a clean `MF_E_HW_MFT_FAILED_START_STREAMING`.
+- **Virtual camera (RaaiCam.VirtualCam, C++):** `IMFMediaSource` + stream implementation per Microsoft VCamSample pattern; registration via `MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_CurrentUser, ...)`. Reads frames from a named shared-memory ring buffer (`Global\` naming with an explicit DACL, confirmed in Phase 0, D17; the production DACL grants only SYSTEM, LocalService and the logged-on user's SID, with GR|GW rather than GA) with a header (frame counter, timestamp, width, height, format, state). Writes "consumer active + client process" back to the header. Phase 0 found: a single unlocked buffer tears, so use double buffering or a sequence lock; pace output with timer-driven delivery rather than sleeping in `RequestSample`; a second simultaneous consumer gets a clean `MF_E_HW_MFT_FAILED_START_STREAMING`.
 
 ### 9.4 Protocol (v1)
 Defined in `protocol/PROTOCOL.md`, versioned (`proto=1`).
@@ -330,7 +330,7 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 
 ### 9.6 Build & distribution ($0)
 - **Repo:** public GitHub repository (owner's connected account). Nothing is pushed without owner approval.
-- **iOS CI:** GitHub Actions `macos-15` + XcodeGen (D19) → `xcodebuild` archive with code signing disabled → package unsigned `.ipa` → upload as workflow artifact + GitHub Release asset.
+- **iOS CI:** GitHub Actions `macos-15` + XcodeGen (D19) → `xcodebuild build` with code signing disabled → hand-zip the `.app` into a `Payload/` folder as an unsigned `.ipa` → upload as workflow artifact + GitHub Release asset.
 - **Install (D20):** iloader on Windows signs in with a free Apple ID and installs via "Import IPA"; re-install from the PC every 7 days. SideStore's on-device sign-in currently fails with -80045 (upstream issues #1709, #1652), so PC-free refresh is unverified; revisit when upstream is fixed.
 - **Windows CI:** GitHub Actions `windows-latest` → build, unit tests, pipeline tests, installer artifact.
 - **Windows install:** installer from GitHub Releases (unsigned; SmartScreen "More info → Run anyway" documented in the wizard guide).

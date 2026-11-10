@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - 'spikes/ios-hello/**'
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: macos-15
