@@ -9,6 +9,7 @@ final class FrameServer {
 
     var onState: ((String) -> Void)?
     var onFrameServed: (() -> Void)?
+    var onSendError: ((String) -> Void)?
 
     init(port: UInt16 = 47820, grabber: CameraGrabber) {
         self.port = port
@@ -41,8 +42,12 @@ final class FrameServer {
         var len = UInt32(jpeg.count).bigEndian
         var packet = Data(bytes: &len, count: 4)
         packet.append(jpeg)
-        conn.send(content: packet, completion: .contentProcessed { [weak self] _ in
-            if !jpeg.isEmpty { self?.onFrameServed?() }
+        conn.send(content: packet, completion: .contentProcessed { [weak self] error in
+            if let error = error {
+                self?.onSendError?("(error)")
+            } else if !jpeg.isEmpty {
+                self?.onFrameServed?()
+            }
             conn.cancel()
         })
     }

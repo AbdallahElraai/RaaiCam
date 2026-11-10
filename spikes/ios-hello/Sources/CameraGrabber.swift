@@ -10,26 +10,43 @@ final class CameraGrabber: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var latestBuffer: CVPixelBuffer?
     private var configured = false
 
+    /// Reports camera setup outcome: "running" or "failed: <reason>".
+    var onState: ((String) -> Void)?
+
     func start() {
         queue.async {
             if !self.configured { self.configure() }
-            if self.configured && !self.session.isRunning { self.session.startRunning() }
+            if self.configured && !self.session.isRunning {
+                self.session.startRunning()
+                self.onState?(self.session.isRunning ? "running" : "failed: session did not start")
+            }
         }
+    }
+
+    private func fail(_ reason: String) {
+        session.commitConfiguration()
+        onState?("failed: \(reason)")
     }
 
     private func configure() {
         session.beginConfiguration()
+        guard session.canSetSessionPreset(.hd1920x1080) else { return fail("1920x1080 preset unsupported") }
         session.sessionPreset = .hd1920x1080
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else {
-            session.commitConfiguration()
-            return
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            return fail("no back wide-angle camera")
         }
+        let input: AVCaptureDeviceInput
+        do {
+            input = try AVCaptureDeviceInput(device: device)
+        } catch {
+            return fail(error.localizedDescription)
+        }
+        guard session.canAddInput(input) else { return fail("cannot add camera input") }
         session.addInput(input)
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: queue)
-        if session.canAddOutput(output) { session.addOutput(output) }
+        guard session.canAddOutput(output) else { return fail("cannot add video output") }
+        session.addOutput(output)
         session.commitConfiguration()
         configured = true
     }
