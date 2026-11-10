@@ -63,15 +63,70 @@ spikes\vcam\build\bin\registrar.exe                                       # keep
 dotnet spikes\framewriter\bin\Release\net10.0-windows\FrameWriter.dll     # color bars; Ctrl+C stops
 ```
 
-### Step 7 — owner app checks (to be filled in by the owner)
+### Step 7 — owner app checks
 
-Run `registrar.exe` (keep it open), then check each app with the writer stopped (grey + moving block) and running (color bars + moving bar).
+Owner-run on 2026-11-10 with `registrar.exe` open and the writer running (color bars). A screenshot of the browser test page was shared in chat; the other results were reported by the owner.
 
-| # | App | Writer stopped: animates? | Writer running: color bars? | Notes / screenshot |
-|---|---|---|---|---|
-| 1 | Zoom desktop → Settings → Video | | | |
-| 2 | Chrome → webcamtests.com (or Meet preview) | | | |
-| 3 | Edge → same | | | |
-| 4 | Discord → Voice & Video preview | | | |
-| 5 | Camera app + Chrome at the same time | | | |
-| 6 | Slack huddle camera (optional) | | | |
+| # | App | Writer running: color bars? | Notes |
+|---|---|---|---|
+| 1 | Zoom desktop | Yes | |
+| 2 | Chrome | Yes | |
+| 3 | Edge | Yes | |
+| 4 | Discord | Yes | |
+| 5 | Google Meet (Chrome) | Yes | |
+| 6 | Two apps at once | Not checked | The automated probe (check D above) showed a clean `MF_E_HW_MFT_FAILED_START_STREAMING` for the second consumer |
+| 7 | Writer-stopped pattern in real apps | Not reported | Verified only by the automated probe (check A) |
+
+**Verdict:** every app the owner tried lists and shows the camera, so the DirectShow fallback (FR-VC-5) is **not needed**.
+
+## iOS build pipeline (Task 3)
+
+- GitHub Actions on `macos-15`. XcodeGen (`brew install xcodegen`, version not pinned) generates the project from `spikes/ios-hello/project.yml`. `xcodebuild` runs with signing disabled and the unsigned `RaaiCamSpike.ipa` is uploaded as a workflow artifact.
+- The first CI run (42826602743) was green with no fixes. Later runs: 42828262331 (after a string fix) and 42849951146 (BSD-socket listener, the build now on the phone). Build minutes were not recorded; GitHub shows them per run.
+- The app is a camera grabber plus a one-shot frame server: `[u32 BE length][JPEG]`, then close, on TCP 47820.
+
+## Install route (Task 5)
+
+| Step | Result |
+|---|---|
+| iloader (Windows) sign-in with a free Apple ID, SideStore install | OK |
+| SideStore on-device Apple ID sign-in | **Fails with -80045.** Known upstream since about 2026-10-12 (https://github.com/SideStore/SideStore/issues/1709, https://github.com/SideStore/SideStore/issues/1652). The workaround was not completed |
+| Install `RaaiCamSpike.ipa` via iloader "Import IPA" | OK. The app runs (camera running, listener ready) |
+| PC-free refresh (SideStore) | **Not verified** |
+| Behavior after the screen locks | **Not verified** |
+
+## USB tunnel (Task 4)
+
+Device: iPhone 11 family (A13), iOS 26.6.2. Apple Devices (Microsoft Store) provides usbmuxd on `127.0.0.1:27015` once it has been run once; before that nothing was listening.
+
+| Probe | Result |
+|---|---|
+| usbmux `Connect` to lockdownd 62078 | Result 0 |
+| usbmux `Connect` to the app's 47820, app using `NWListener` | **Result 3 (refused)**. Wi-Fi to the same listener worked |
+| Wi-Fi TCP 192.168.1.20:47820 | Connected, 80,095-byte 1920x1080 JPEG |
+| usbmux to 47820 after replacing `NWListener` with a POSIX socket bound to INADDR_ANY | OK: 428,802-byte 1920x1080 JPEG in **66 ms** (connect + fetch) |
+
+`NWListener` is not reachable through usbmux. A BSD socket bound to INADDR_ANY works for both USB and Wi-Fi.
+
+## Environment notes
+
+- PC: Windows 11 build 26200. C: has only about 2 GB free, so MSVC (VS 2026 Build Tools, `D:\VS\BuildTools`) and the Windows SDK (`D:\WindowsKits`) are on D:. This is a risk for Phase 1.
+- Not verified in Phase 0: screen-lock behavior of the phone app, PC-free SideStore refresh, and two apps using the camera at once (owner check).
+
+## Decisions
+
+| # | Decision | Evidence |
+|---|---|---|
+| D17 | Shared memory and event use the `Global\` namespace, DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`. Created by the DLL inside Frame Server, opened by the user-mode writer. | Virtual camera section |
+| D18 | DirectShow fallback **not needed**: Chrome, Edge, Zoom, Google Meet and Discord all show the camera. | Step 7 table |
+| D19 | iOS pipeline confirmed: GitHub Actions `macos-15` + XcodeGen builds an unsigned .ipa, green on the first attempt. | iOS build pipeline |
+| D20 | Install route: iloader (Windows, free Apple ID) "Import IPA", re-install from the PC every 7 days. SideStore PC-free refresh is blocked by the upstream -80045 bug; revisit later. | Install route |
+| D21 | USB tunnel confirmed: Apple Devices usbmuxd on 127.0.0.1:27015, 66 ms for a 1080p JPEG. Needs the Apple Devices app run once. | USB tunnel |
+| D22 | The iOS listener must be a **POSIX/BSD socket** on INADDR_ANY, not `NWListener`. | USB tunnel |
+
+## Implications for Phase 1
+
+- Virtual camera: double buffering or a sequence lock (tearing); timer-driven frame delivery instead of sleeping in `RequestSample`; the installer does the one-time elevated HKLM registration; Frame Server holds the DLL 35-50 s after use, so updates and rebuilds must handle the locked file.
+- A second consumer fails cleanly, so the app can show an "in use" state instead of hanging.
+- iOS: BSD-socket listener; Bonjour can be advertised separately.
+- Check free space on C: before installing anything large.

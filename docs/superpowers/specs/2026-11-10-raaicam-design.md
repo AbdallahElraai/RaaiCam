@@ -52,7 +52,7 @@ Apple's Continuity Camera (Center Stage, Portrait, Desk View) only works on Mac.
 | D1 | Windows 11 first and only | Biggest unmet need; `MFCreateVirtualCamera` is Win11-only and works in browsers |
 | D2 | AI runs on the PC, phone stays thin | Phone app can't be debugged without a Mac; iPhone 11/12 thermals; GPU available |
 | D3 | Native Swift iOS app, built on GitHub Actions macOS runners (public repo) | Full camera API access; free unlimited cloud builds |
-| D4 | Install via free Apple ID + SideStore (on-device auto-refresh); AltServer fallback | $0, "always works" without a paid account |
+| D4 | Install via free Apple ID. **Phase 0 result: use iloader "Import IPA" from the PC, re-install every 7 days (D20).** SideStore on-device refresh is a later goal | $0, no paid account; SideStore sign-in is currently broken upstream |
 | D5 | Windows stack: C# (.NET 10) + WinUI 3 tray app; C++ MF virtual-camera media source; ONNX Runtime (DirectML) for AI; D3D11 GPU pipeline | Native Win11 look, best performance and compatibility |
 | D6 | Transport: VideoToolbox H.264 (HEVC optional) → USB via Apple usbmux (127.0.0.1:27015) or Wi-Fi | Hardware encode/decode, low bandwidth, <100 ms |
 | D7 | 100% local; no accounts, telemetry or cloud | Privacy + $0 |
@@ -65,6 +65,12 @@ Apple's Continuity Camera (Center Stage, Portrait, Desk View) only works on Mac.
 | D14 | Windows app autostarts in the tray | Always ready |
 | D15 | Phase 0 feasibility spike before real build | Zoom + MF virtual camera compatibility is unconfirmed |
 | D16 | Eye contact = v3 experimental | No RTX; open-source models are lower quality |
+| D17 | Virtual-camera shared memory and frame event use the `Global\` namespace with DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`; created by the DLL inside Frame Server | Phase 0: worked first try; user-mode writer opens both by name |
+| D18 | No DirectShow fallback in v1 (FR-VC-5 dropped) | Phase 0: Chrome, Edge, Zoom, Google Meet and Discord all show the MF virtual camera |
+| D19 | iOS build pipeline: GitHub Actions `macos-15` + XcodeGen, unsigned .ipa | Phase 0: green on the first attempt |
+| D20 | Install route: iloader (Windows) "Import IPA" with a free Apple ID, re-install from the PC every 7 days. SideStore PC-free refresh deferred | SideStore on-device sign-in fails with -80045 (upstream issues #1709, #1652); PC-free refresh not verified |
+| D21 | USB tunnel: Apple Devices app provides usbmuxd on 127.0.0.1:27015; app port 47820 reachable over it | Phase 0: 1080p JPEG fetched in 66 ms (connect + fetch) on iPhone 11 family, iOS 26.6.2 |
+| D22 | The iOS listener is a POSIX/BSD socket bound to INADDR_ANY, **not** `NWListener` | Phase 0: usbmux `Connect` to an `NWListener` port returns Result 3 (refused), Wi-Fi works; BSD socket works on both |
 
 ---
 
@@ -119,11 +125,11 @@ IDs: `FR-<area>-<n>`. **[v1]/[v2]/[v3]** = release.
 - **FR-STR-6 [v1]** The phone camera runs only while some app is consuming the RaaiCam virtual camera (or the preview panel is open). Otherwise the phone is idle (camera session stopped).
 
 ### 5.3 Virtual camera
-- **FR-VC-1 [v1]** Register a Windows 11 virtual camera named **"RaaiCam"** via `MFCreateVirtualCamera` (per-user, no admin), exposing NV12 1920×1080@30 and 1280×720@30.
+- **FR-VC-1 [v1]** Register a Windows 11 virtual camera named **"RaaiCam"** via `MFCreateVirtualCamera` (camera add/remove needs no admin, but the one-time COM registration of the DLL needs an elevated HKLM `regsvr32`; see §9.3), exposing NV12 1920×1080@30 and 1280×720@30.
 - **FR-VC-2 [v1]** The C++ media source (runs inside Windows Frame Server) reads frames from the RaaiCam app through a shared-memory ring buffer + named events. It never runs AI or networking itself.
 - **FR-VC-3 [v1]** When the RaaiCam app or phone isn't delivering frames, the media source/app outputs placeholder cards (FR-UI-12) rather than black.
 - **FR-VC-4 [v1]** Detect "camera in use / released" from the media source and signal the app (drives FR-STR-6).
-- **FR-VC-5 [v1]** Fallback (only if the Phase 0 spike shows an app can't see MF virtual cameras): add a DirectShow source filter that reads the same shared memory.
+- **FR-VC-5 [dropped]** DirectShow fallback. Phase 0 showed Chrome, Edge, Zoom, Google Meet and Discord all see the MF virtual camera (D18). Revisit only if a target app fails later.
 - **FR-VC-6 [v1]** Report which app is using the camera (process name) to the app, when Windows exposes it. Used for "IN USE · Zoom" and v2 per-app presets.
 
 ### 5.4 Camera controls (all from PC; each has Auto/Manual)
@@ -207,7 +213,7 @@ Defaults (all rebindable, conflict detection):
 
 ### J1: First setup (guided wizard)
 1. Install RaaiCam for Windows → wizard opens → setup doctor runs (FR-DX-1) and guides fixes (e.g., install Apple Devices app from Microsoft Store).
-2. "Install the iPhone app" step: illustrated guide for SideStore (one-time) and installing the RaaiCam .ipa (downloaded from the project's GitHub Releases).
+2. "Install the iPhone app" step: illustrated guide for iloader (one-time) and installing the RaaiCam .ipa (downloaded from the project's GitHub Releases).
 3. Phone app opens → camera permission → scan QR on PC → paired.
 4. Calibrate: preview appears; RaaiCam suggests lens/framing size; user confirms. Done screen: "Open Zoom and pick 'RaaiCam' as your camera."
 
@@ -282,14 +288,14 @@ D:\RaaiCam
 ### 9.2 iOS app (thin)
 - **Capture:** `AVCaptureSession` with `AVCaptureDevice` for `.builtInWideAngleCamera` / `.builtInUltraWideCamera` (back). `AVCaptureMetadataOutput` face metadata used *on phone* to drive focus/exposure point of interest (cheap, no ML code).
 - **Encode:** `VTCompressionSession` H.264 High, `kVTCompressionPropertyKey_RealTime`, `AllowFrameReordering=false`, average bitrate + data-rate limits, keyframe interval 60.
-- **Network:** `Network.framework`: `NWListener` on a fixed port (e.g. 47820) for USB/Wi-Fi TCP control+video; Bonjour advertisement `_raaicam._tcp`; Wi-Fi video over UDP (`NWConnection`) with sequence numbers.
+- **Network:** a POSIX/BSD socket listener bound to INADDR_ANY on a fixed port (47820) for USB/Wi-Fi TCP control+video. `NWListener` does **not** work: usbmux connections to it are refused (Phase 0, D22). Bonjour advertisement `_raaicam._tcp` (mechanism to be chosen in Phase 1; not tested in Phase 0); Wi-Fi video over UDP (`NWConnection`) with sequence numbers.
 - **Control handler:** applies camera commands (lens, zoom, focus, exposure, ISO, shutter, WB), start/stop capture, keyframe/bitrate/resolution requests.
 - **Telemetry:** thermal state, battery, charge state, fps, encoder bitrate, provisioning expiry [v2]; log forwarding.
 - **UI:** SwiftUI screens per §7; `UIApplication.isIdleTimerDisabled = true`; brightness dimming.
 - **Min iOS:** 17.0 (iPhone 11/12 support newer). No third-party dependencies.
 
 ### 9.3 Windows app
-- **Runtime:** .NET 10, WinUI 3 (Windows App SDK), unpackaged with an installer (Inno Setup or MSIX sideload) that registers the virtual camera DLL under a location readable by Frame Server services.
+- **Runtime:** .NET 10, WinUI 3 (Windows App SDK), unpackaged with an installer (Inno Setup or MSIX sideload) that registers the virtual camera DLL under a location readable by Frame Server services. Registration is a one-time elevated step: HKCU-only COM registration fails (`IMFVirtualCamera::Start` returns 0x80070003), so the installer runs `regsvr32` into HKLM. Frame Server keeps the DLL loaded for about 35-50 s after use, so updates must wait for it or restart the service.
 - **Tray:** H.NotifyIcon.WinUI (or equivalent); single-instance; autostart via Startup task/registry Run key.
 - **Connection manager (RaaiCam.Core):**
   - `UsbmuxClient`: speaks usbmux plist protocol over TCP 127.0.0.1:27015 (`Listen` for attach/detach, `Connect` to device port 47820).
@@ -298,7 +304,7 @@ D:\RaaiCam
   - `Session`: pairing/auth, crypto (X25519 + HKDF + AES-256-GCM via .NET `System.Security.Cryptography`), command/telemetry dispatch.
 - **Media pipeline (RaaiCam.Media):** Media Foundation H.264 decoder with D3D11 device manager (NVDEC on NVIDIA) → NV12 `ID3D11Texture2D` → convert to RGB → Vision passes → compositing compute shaders (crop/scale with Lanczos/bicubic, blur, look/LUT, overlays) → NV12 → write to shared memory for the virtual camera and to the panel preview (SwapChainPanel). C# D3D11 interop via Vortice.Windows.
 - **Vision (RaaiCam.Vision):** ONNX Runtime + DirectML EP sharing the D3D12/DX device where possible (fallback: CPU copy at low res). Face detector at ~320 px every frame (or every 2nd frame + tracking); segmentation at 256–512 px; framing controller (pure C#, unit-tested).
-- **Virtual camera (RaaiCam.VirtualCam, C++):** `IMFMediaSource` + stream implementation per Microsoft VCamSample pattern; registration via `MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_CurrentUser, ...)`. Reads frames from a named shared-memory ring buffer (`Local\`/`Global\` naming decided in spike based on Frame Server session) with a header (frame counter, timestamp, width, height, format, state). Writes "consumer active + client process" back to the header.
+- **Virtual camera (RaaiCam.VirtualCam, C++):** `IMFMediaSource` + stream implementation per Microsoft VCamSample pattern; registration via `MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_CurrentUser, ...)`. Reads frames from a named shared-memory ring buffer (`Global\` naming with DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`, confirmed in Phase 0, D17) with a header (frame counter, timestamp, width, height, format, state). Writes "consumer active + client process" back to the header. Phase 0 found: a single unlocked buffer tears, so use double buffering or a sequence lock; pace output with timer-driven delivery rather than sleeping in `RequestSample`; a second simultaneous consumer gets a clean `MF_E_HW_MFT_FAILED_START_STREAMING`.
 
 ### 9.4 Protocol (v1)
 Defined in `protocol/PROTOCOL.md`, versioned (`proto=1`).
@@ -324,8 +330,8 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 
 ### 9.6 Build & distribution ($0)
 - **Repo:** public GitHub repository (owner's connected account). Nothing is pushed without owner approval.
-- **iOS CI:** GitHub Actions `macos-latest` → `xcodebuild` archive with code signing disabled → package unsigned `.ipa` → upload as workflow artifact + GitHub Release asset.
-- **Install:** SideStore (installed once from Windows via iLoader/AltServer) imports the .ipa and signs it with the free Apple ID; auto-refresh on device every <7 days. Fallback: AltServer on the PC.
+- **iOS CI:** GitHub Actions `macos-15` + XcodeGen (D19) → `xcodebuild` archive with code signing disabled → package unsigned `.ipa` → upload as workflow artifact + GitHub Release asset.
+- **Install (D20):** iloader on Windows signs in with a free Apple ID and installs via "Import IPA"; re-install from the PC every 7 days. SideStore's on-device sign-in currently fails with -80045 (upstream issues #1709, #1652), so PC-free refresh is unverified; revisit when upstream is fixed.
 - **Windows CI:** GitHub Actions `windows-latest` → build, unit tests, pipeline tests, installer artifact.
 - **Windows install:** installer from GitHub Releases (unsigned; SmartScreen "More info → Run anyway" documented in the wizard guide).
 
@@ -374,7 +380,7 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| **0 · Spike (throwaway)** | (a) C++ MF virtual camera with animated test pattern; (b) GitHub Actions builds a hello-world iOS .ipa; (c) installed via SideStore on the owner's iPhone; (d) C# usbmux client connects to the phone app and receives one frame | "RaaiCam Test" visible and moving in Zoom, Meet (Chrome), Discord; app runs on phone; USB round-trip works. **If Zoom fails → plan DirectShow fallback (FR-VC-5).** |
+| **0 · Spike (throwaway) — DONE 2026-11-10, see `docs/spikes/phase0-results.md`** | (a) C++ MF virtual camera with animated test pattern; (b) GitHub Actions builds a hello-world iOS .ipa; (c) installed via SideStore on the owner's iPhone; (d) C# usbmux client connects to the phone app and receives one frame | "RaaiCam Test" visible and moving in Zoom, Meet (Chrome), Discord; app runs on phone; USB round-trip works. **If Zoom fails → plan DirectShow fallback (FR-VC-5).** |
 | **1 · Basic webcam** | iOS capture/encode/stream/dim UI; pairing; USB+Wi-Fi failover; decode; virtual camera; basic tray panel with preview + stats | Owner uses it in a real meeting; latency targets met |
 | **2 · Smart v1** | Auto-framing, blur, manual controls, hotkeys, setup doctor, wizard, placeholder cards, thermal guard, model benchmark | All v1 FRs pass checklist; 2-hour real meeting test |
 | **3 · v2** | Touch-up, presets + per-app, overlays, desk view, cert expiry | v2 FRs pass |
@@ -386,9 +392,13 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Zoom (or another app) doesn't list MF virtual cameras | High | Phase 0 spike; DirectShow fallback filter |
-| Frame Server can't access shared memory / DLL path | High | Spike validates naming/ACLs; follow VCamSample install pattern |
-| SideStore/free-signing changes by Apple | Medium | AltServer fallback; keep phone app small; option to switch to paid account later |
+| ~~Zoom (or another app) doesn't list MF virtual cameras~~ | Resolved | Phase 0: Chrome, Edge, Zoom, Meet and Discord all work; no DirectShow fallback (D18) |
+| ~~Frame Server can't access shared memory / DLL path~~ | Resolved | Phase 0: `Global\` + DACL works (D17); needs a one-time elevated HKLM `regsvr32` (installer) |
+| Virtual-camera tearing / pacing | Medium | Double buffer or seqlock; timer-driven delivery (Phase 1) |
+| SideStore broken (-80045) / free-signing changes by Apple | Medium | iloader re-install every 7 days (D20); revisit SideStore later; keep phone app small; option to switch to paid account later |
+| 7-day free-signing expiry needs a PC step | Medium | Phone app shows expiry [v2]; wizard explains the weekly re-install |
+| Phone app behavior when the screen locks | Medium | Unverified in Phase 0; test early in Phase 1 (idle timer disabled, dimmed UI) |
+| C: drive nearly full on the dev PC (about 2 GB free) | Low/Med | Tools live on D:; keep installs and build output off C: |
 | Apple Mobile Device Service missing/broken | Medium | Setup doctor detects + guides install of Apple Devices app; Wi-Fi still works |
 | iPhone 11/12 overheating at 4K | Medium | 4K only on demand; thermal guard; prefer 1080p + lens switch |
 | GTX 1660S too slow for RVM | Medium | Benchmark; MediaPipe baseline; run segmentation every 2nd frame + temporal interpolation |
@@ -401,4 +411,8 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 - Exact face-detector model (YuNet vs SCRFD): benchmark in Phase 2.
 - Segmentation model (MediaPipe vs RVM): benchmark in Phase 2.
 - Installer technology (Inno Setup vs MSIX sideload): decide in Phase 1 based on virtual-camera DLL registration needs.
-- Repo name on GitHub: confirm with owner before first push.
+- ~~Repo name on GitHub~~: closed. Repo "RaaiCam" created and pushed in Phase 0 with owner consent.
+- ~~Installer technology decision depends on DLL registration~~: narrowed. Registration needs an elevated HKLM `regsvr32`, so the installer must run elevated once (Inno Setup is the likely fit); decide in Phase 1.
+- Phone app behavior after screen lock (not verified in Phase 0).
+- SideStore PC-free refresh: revisit once upstream fixes -80045.
+- Two real apps using the camera at once (only the automated probe was run).
