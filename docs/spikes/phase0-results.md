@@ -74,8 +74,9 @@ Owner-run on 2026-11-10 with `registrar.exe` open and the writer running (color 
 | 3 | Edge | Yes | |
 | 4 | Discord | Yes | |
 | 5 | Google Meet (Chrome) | Yes | |
-| 6 | Two apps at once | Not checked | The automated probe (check D above) showed a clean `MF_E_HW_MFT_FAILED_START_STREAMING` for the second consumer |
-| 7 | Writer-stopped pattern in real apps | Not reported | Verified only by the automated probe (check A) |
+| 6 | Slack | Not checked | |
+| 7 | Two apps at once | Not checked | The automated probe (check D above) showed a clean `MF_E_HW_MFT_FAILED_START_STREAMING` for the second consumer |
+| 8 | Writer-stopped pattern in real apps | Not reported | Verified only by the automated probe (check A) |
 
 **Verdict:** every app the owner tried lists and shows the camera, so the DirectShow fallback (FR-VC-5) is **not needed**.
 
@@ -103,7 +104,7 @@ Device: iPhone 11 family (A13), iOS 26.6.2. Apple Devices (Microsoft Store) prov
 |---|---|
 | usbmux `Connect` to lockdownd 62078 | Result 0 |
 | usbmux `Connect` to the app's 47820, app using `NWListener` | **Result 3 (refused)**. Wi-Fi to the same listener worked |
-| Wi-Fi TCP 192.168.1.20:47820 | Connected, 80,095-byte 1920x1080 JPEG |
+| Wi-Fi TCP 192.168.1.20:47820 | Connected, 80,095-byte 1920x1080 JPEG (black frame, lens likely covered, so this proves transport only) |
 | usbmux to 47820 after replacing `NWListener` with a POSIX socket bound to INADDR_ANY | OK: 428,802-byte 1920x1080 JPEG in **66 ms** (connect + fetch) |
 
 `NWListener` is not reachable through usbmux. A BSD socket bound to INADDR_ANY works for both USB and Wi-Fi.
@@ -119,7 +120,7 @@ Device: iPhone 11 family (A13), iOS 26.6.2. Apple Devices (Microsoft Store) prov
 |---|---|---|
 | D17 | Shared memory and event use the `Global\` namespace, DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`. Created by the DLL inside Frame Server, opened by the user-mode writer. | Virtual camera section |
 | D18 | DirectShow fallback **not needed**: Chrome, Edge, Zoom, Google Meet and Discord all show the camera. | Step 7 table |
-| D19 | iOS pipeline confirmed: GitHub Actions `macos-15` + XcodeGen builds an unsigned .ipa, green on the first attempt. | iOS build pipeline |
+| D19 | iOS pipeline confirmed: GitHub Actions `macos-15` + XcodeGen builds an unsigned .ipa. The first CI run was green; later runs rebuilt for code changes (incl. the NWListener→BSD fix). | iOS build pipeline |
 | D20 | Install route: iloader (Windows, free Apple ID) "Import IPA", re-install from the PC every 7 days. SideStore PC-free refresh is blocked by the upstream -80045 bug; revisit later. | Install route |
 | D21 | USB tunnel confirmed: Apple Devices usbmuxd on 127.0.0.1:27015, 66 ms for a 1080p JPEG. Needs the Apple Devices app run once. | USB tunnel |
 | D22 | The iOS listener must be a **POSIX/BSD socket** on INADDR_ANY, not `NWListener`. | USB tunnel |

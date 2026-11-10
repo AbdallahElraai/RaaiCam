@@ -65,9 +65,9 @@ Apple's Continuity Camera (Center Stage, Portrait, Desk View) only works on Mac.
 | D14 | Windows app autostarts in the tray | Always ready |
 | D15 | Phase 0 feasibility spike before real build | Zoom + MF virtual camera compatibility is unconfirmed |
 | D16 | Eye contact = v3 experimental | No RTX; open-source models are lower quality |
-| D17 | Virtual-camera shared memory and frame event use the `Global\` namespace with DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`; created by the DLL inside Frame Server | Phase 0: worked first try; user-mode writer opens both by name |
+| D17 | Virtual-camera shared memory and frame event use the `Global\` namespace with DACL `D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)`; created by the DLL inside Frame Server | Phase 0: confirmed working; user-mode writer opens both by name |
 | D18 | No DirectShow fallback in v1 (FR-VC-5 dropped) | Phase 0: Chrome, Edge, Zoom, Google Meet and Discord all show the MF virtual camera |
-| D19 | iOS build pipeline: GitHub Actions `macos-15` + XcodeGen, unsigned .ipa | Phase 0: green on the first attempt |
+| D19 | iOS build pipeline: GitHub Actions `macos-15` + XcodeGen, unsigned .ipa | Phase 0: first CI run was green; later runs rebuilt for code changes (incl. the NWListener→BSD fix) |
 | D20 | Install route: iloader (Windows) "Import IPA" with a free Apple ID, re-install from the PC every 7 days. SideStore PC-free refresh deferred | SideStore on-device sign-in fails with -80045 (upstream issues #1709, #1652); PC-free refresh not verified |
 | D21 | USB tunnel: Apple Devices app provides usbmuxd on 127.0.0.1:27015; app port 47820 reachable over it | Phase 0: 1080p JPEG fetched in 66 ms (connect + fetch) on iPhone 11 family, iOS 26.6.2 |
 | D22 | The iOS listener is a POSIX/BSD socket bound to INADDR_ANY, **not** `NWListener` | Phase 0: usbmux `Connect` to an `NWListener` port returns Result 3 (refused), Wi-Fi works; BSD socket works on both |
@@ -79,7 +79,7 @@ Apple's Continuity Camera (Center Stage, Portrait, Desk View) only works on Mac.
 ### v1 (Phases 1–2): "Smart webcam"
 - Streaming phone→PC over USB and Wi-Fi with automatic failover
 - QR pairing, encrypted link, auto-reconnect
-- "RaaiCam" virtual camera visible in Zoom, Meet, Discord, Slack
+- "RaaiCam" virtual camera visible in Zoom, Meet, Discord, Slack (Slack untested in Phase 0)
 - Auto start/stop when an app opens or releases the camera
 - Tray app + panel (preview, toggles, live stats)
 - Auto-framing (calm, locked on main person, framing size options)
@@ -362,7 +362,7 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 - **PC resources:** ≤ 10% CPU (Ryzen/Intel 6-core class) and ≤ 12 ms GPU per frame with blur + framing.
 - **Phone:** sustains 1080p30 for 2 h plugged in at room temperature without hitting `.critical` (iPhone 11/12, case off).
 - **Privacy/security:** no outbound internet traffic from either app (except the user opening docs links); Wi-Fi traffic encrypted and authenticated; pairing token single-use, 5-minute validity.
-- **Compatibility:** Zoom (desktop), Google Meet in Chrome and Edge, Discord, Slack; Teams best-effort.
+- **Compatibility:** Zoom (desktop), Google Meet in Chrome and Edge, Discord, Slack (Slack untested in Phase 0); Teams best-effort.
 
 ---
 
@@ -380,7 +380,7 @@ No APIs to external services. The only network traffic is phone↔PC on the LAN/
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| **0 · Spike (throwaway) — DONE 2026-11-10, see `docs/spikes/phase0-results.md`** | (a) C++ MF virtual camera with animated test pattern; (b) GitHub Actions builds a hello-world iOS .ipa; (c) installed via SideStore on the owner's iPhone; (d) C# usbmux client connects to the phone app and receives one frame | "RaaiCam Test" visible and moving in Zoom, Meet (Chrome), Discord; app runs on phone; USB round-trip works. **If Zoom fails → plan DirectShow fallback (FR-VC-5).** |
+| **0 · Spike (throwaway) — DONE 2026-11-10, see `docs/spikes/phase0-results.md`** | (a) C++ MF virtual camera with animated test pattern; (b) GitHub Actions builds a hello-world iOS .ipa; (c) installed on the owner's iPhone via iloader "Import IPA" (SideStore sign-in failed, -80045); (d) C# usbmux client connects to the phone app and receives one frame | Result: "RaaiCam Test" showed color bars in Chrome, Edge, Zoom, Google Meet and Discord (Slack not tested); app runs on phone; USB round-trip works (66 ms). All apps passed, so FR-VC-5 is dropped. |
 | **1 · Basic webcam** | iOS capture/encode/stream/dim UI; pairing; USB+Wi-Fi failover; decode; virtual camera; basic tray panel with preview + stats | Owner uses it in a real meeting; latency targets met |
 | **2 · Smart v1** | Auto-framing, blur, manual controls, hotkeys, setup doctor, wizard, placeholder cards, thermal guard, model benchmark | All v1 FRs pass checklist; 2-hour real meeting test |
 | **3 · v2** | Touch-up, presets + per-app, overlays, desk view, cert expiry | v2 FRs pass |
