@@ -8,3 +8,4 @@ build/
 *.ipa
 spikes/out/
 *.xcodeproj/
+spikes/_ref/
