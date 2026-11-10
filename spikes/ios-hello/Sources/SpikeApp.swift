@@ -33,10 +33,10 @@ struct ContentView: View {
         VStack(spacing: 16) {
             Text("RaaiCam Spike").font(.largeTitle).bold()
             Text("Camera permission: \(model.cameraState)")
-            Text("Camera: (model.cameraStatus)")
+            Text("Camera: \(model.cameraStatus)")
             Text("Listener: \(model.listenerState)")
             Text("Frames served: \(model.framesServed)")
-            Text("Last send error: (model.lastSendError)")
+            Text("Last send error: \(model.lastSendError)")
         }
         .padding()
         .onAppear { model.start() }

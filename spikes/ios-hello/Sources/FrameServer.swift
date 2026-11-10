@@ -44,7 +44,7 @@ final class FrameServer {
         packet.append(jpeg)
         conn.send(content: packet, completion: .contentProcessed { [weak self] error in
             if let error = error {
-                self?.onSendError?("(error)")
+                self?.onSendError?("\(error)")
             } else if !jpeg.isEmpty {
                 self?.onFrameServed?()
             }
