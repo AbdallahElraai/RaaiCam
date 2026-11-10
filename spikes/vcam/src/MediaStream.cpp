@@ -59,7 +59,8 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 
 HRESULT MediaStream::Start(IMFMediaType* type)
 {
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue || !_allocator);
+	winrt::slim_lock_guard lock(_lock); // RaaiCam: serialize with RequestSample/Stop/Shutdown
+	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue || !_allocator || !_descriptor);
 
 	wil::com_ptr_nothrow<IMFMediaType> current;
 	if (!type)
@@ -84,6 +85,7 @@ HRESULT MediaStream::Start(IMFMediaType* type)
 
 HRESULT MediaStream::Stop()
 {
+	winrt::slim_lock_guard lock(_lock); // RaaiCam: serialize with RequestSample/Start/Shutdown
 	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue || !_allocator);
 
 	VLog(L"MediaStream::Stop (state was %u)", _state);
@@ -121,6 +123,12 @@ HRESULT MediaStream::SetD3DManager(IUnknown* manager)
 
 void MediaStream::Shutdown()
 {
+	winrt::slim_lock_guard lock(_lock); // RaaiCam: upstream reset these without the lock
+	if (_state != MF_STREAM_STATE_STOPPED)
+	{
+		FrameSource::Instance().StreamStopped(); // shutdown without Stop: keep consumerActive accurate
+		_state = MF_STREAM_STATE_STOPPED;
+	}
 	if (_queue)
 	{
 		LOG_IF_FAILED_MSG(_queue->Shutdown(), "Queue shutdown failed");
@@ -204,27 +212,27 @@ STDMETHODIMP MediaStream::GetStreamDescriptor(IMFStreamDescriptor** ppStreamDesc
 STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
 {
 	//WINTRACE(L"MediaStream::RequestSample pToken:%p", pToken);
-	winrt::slim_lock_guard lock(_lock);
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_allocator || !_queue);
-
-	wil::com_ptr_nothrow<IMFSample> sample;
-	RETURN_IF_FAILED(_allocator->AllocateSample(&sample));
-	RETURN_IF_FAILED(sample->SetSampleTime(MFGetSystemTime()));
-	RETURN_IF_FAILED(sample->SetSampleDuration(333333));
 
 	// RaaiCam: pace delivery at 30 fps. Upstream delivers on every request, which Frame Server
 	// issues back to back (measured ~2500 samples/s), so the "4 px/frame" block and CPU use are
-	// meaningless without it. Sleeps at most one frame period.
+	// meaningless without it. The slot is reserved under _lock, but the sleep (at most one frame
+	// period) happens OUTSIDE _lock so Stop/Shutdown/event calls are never blocked by it.
+	DWORD waitMs = 0;
 	{
+		winrt::slim_lock_guard lock(_lock);
+		RETURN_HR_IF(MF_E_SHUTDOWN, !_allocator || !_queue);
+		if (_state == MF_STREAM_STATE_STOPPED)
+			return S_OK; // stopped: no sample
+
 		LARGE_INTEGER now{}, freq{};
 		QueryPerformanceCounter(&now);
 		QueryPerformanceFrequency(&freq);
 		auto period = freq.QuadPart / 30;
 		if (_nextSampleQpc > now.QuadPart)
 		{
-			auto waitMs = (DWORD)((_nextSampleQpc - now.QuadPart) * 1000 / freq.QuadPart);
-			if (waitMs > 0)
-				Sleep(waitMs < 34 ? waitMs : 34);
+			waitMs = (DWORD)((_nextSampleQpc - now.QuadPart) * 1000 / freq.QuadPart);
+			if (waitMs > 34)
+				waitMs = 34;
 			_nextSampleQpc += period;
 		}
 		else
@@ -233,15 +241,28 @@ STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
 		}
 	}
 
+	if (waitMs > 0)
+		Sleep(waitMs);
+
+	// Re-take the lock and re-check: a Stop or Shutdown may have run during the sleep.
+	winrt::slim_lock_guard lock(_lock);
+	RETURN_HR_IF(MF_E_SHUTDOWN, !_allocator || !_queue);
+	if (_state == MF_STREAM_STATE_STOPPED)
+		return S_OK; // stopped while sleeping: drop the request, never queue after MEStreamStopped
+
+	wil::com_ptr_nothrow<IMFSample> sample;
+	RETURN_IF_FAILED(_allocator->AllocateSample(&sample));
+	RETURN_IF_FAILED(sample->SetSampleTime(MFGetSystemTime()));
+	RETURN_IF_FAILED(sample->SetSampleDuration(333333));
+
 	// RaaiCam: fill from shared memory or the "no signal" pattern
 	RETURN_IF_FAILED(FrameSource::Instance().GetFrame(sample.get(), _width, _height));
-	auto& outSample = sample;
 
 	if (pToken)
 	{
-		RETURN_IF_FAILED(outSample->SetUnknown(MFSampleExtension_Token, pToken));
+		RETURN_IF_FAILED(sample->SetUnknown(MFSampleExtension_Token, pToken));
 	}
-	RETURN_IF_FAILED(_queue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, outSample.get()));
+	RETURN_IF_FAILED(_queue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample.get()));
 	return S_OK;
 }
 
@@ -255,16 +276,25 @@ STDMETHODIMP MediaStream::SetStreamState(MF_STREAM_STATE value)
 	switch (value)
 	{
 	case MF_STREAM_STATE_PAUSED:
+	{
+		winrt::slim_lock_guard lock(_lock);
 		if (_state != MF_STREAM_STATE_RUNNING)
 			RETURN_HR(MF_E_INVALID_STATE_TRANSITION);
 
 		_state = value;
 		break;
+	}
 
 	case MF_STREAM_STATE_RUNNING:
-		if (_state == MF_STREAM_STATE_PAUSED) { _state = value; break; } // RaaiCam: resume without re-initializing the allocator
-		RETURN_IF_FAILED(Start(nullptr));
+	{
+		{
+			// RaaiCam: resume without re-initializing the allocator
+			winrt::slim_lock_guard lock(_lock);
+			if (_state == MF_STREAM_STATE_PAUSED) { _state = value; break; }
+		}
+		RETURN_IF_FAILED(Start(nullptr)); // takes _lock itself
 		break;
+	}
 
 	case MF_STREAM_STATE_STOPPED:
 		RETURN_IF_FAILED(Stop());

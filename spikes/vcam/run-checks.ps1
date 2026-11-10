@@ -53,6 +53,27 @@ try {
     Get-Content "$out\D-probe2.txt" | Select-String 'opened|TRANSITION|frames=|CLASSIFICATION|TIMEOUT|hr='
     $w.WaitForExit()
     Get-Content "$out\D-writer.txt" | Select-String 'consumerActive|opened|stopped'
+
+    Write-Output "=== E: stress - kill the probe mid-stream 10 times, then check Frame Server health ==="
+    $since = Get-Date
+    $fsPidBefore = (Get-CimInstance Win32_Service -Filter "Name='FrameServer'").ProcessId
+    Write-Output "FrameServer svchost PID before: $fsPidBefore"
+    $w = Start-Process dotnet -ArgumentList $writerDll, '--wait', '5' -RedirectStandardOutput "$out\E-writer.txt" -NoNewWindow -PassThru
+    for ($i = 1; $i -le 10; $i++) {
+        $p = Start-Process "$bin\probe.exe" -ArgumentList '--frames', '1000', '--out', "$out\E-kill.bmp" -RedirectStandardOutput "$out\E-kill-$i.txt" -NoNewWindow -PassThru
+        Start-Sleep -Milliseconds (300 + 150 * $i)
+        Stop-Process -Id $p.Id -Force
+        $opened = [bool](Select-String -Path "$out\E-kill-$i.txt" -Pattern '^opened' -Quiet)
+        Write-Output "$(Stamp) iteration $i killed probe after $(300 + 150 * $i) ms (stream opened: $opened)"
+    }
+    Stop-Process -Id $w.Id -Force
+    Start-Sleep -Seconds 1
+    & "$bin\probe.exe" --frames 30 --width 1280 --height 720 --out "$out\E-after.bmp" | Tee-Object "$out\E-after.txt" | Select-String 'opened|TRANSITION|frames=|CLASSIFICATION|TIMEOUT|hr='
+    $fsPidAfter = (Get-CimInstance Win32_Service -Filter "Name='FrameServer'").ProcessId
+    Write-Output "FrameServer svchost PID after: $fsPidAfter (same process: $($fsPidBefore -eq $fsPidAfter))"
+    $crashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000; StartTime = $since } -ErrorAction SilentlyContinue)
+    Write-Output "Application Error (1000) events since $($since.ToString('HH:mm:ss')): $($crashes.Count)"
+    $crashes | ForEach-Object { Write-Output ("  " + $_.TimeCreated + " " + ($_.Message -split "`n")[0]) }
 }
 finally {
     & "$bin\registrar.exe" --stop | Out-Null

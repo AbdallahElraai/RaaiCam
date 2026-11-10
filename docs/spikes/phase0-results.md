@@ -39,6 +39,7 @@ Frame Server keeps the DLL loaded for about 35–50 s after the last client and 
 | B. Writer running, then camera opened | LIVE from frame 1 (frame 0 is the pattern for 33 ms). The bar samples are exactly the writer's BT.601 values (180/162/131/112/84/65/35/16 Y), 60/60 frames distinct, writer printed `consumerActive=1` and then `0` |
 | C. Camera open, writer started mid-stream | Writer opened the mapping at 16:22:29.196; the probe turned LIVE at 16:22:29.278 (**~80 ms**) |
 | C. Writer killed (`Stop-Process -Force`) mid-stream | Killed at 16:22:33.142; the probe turned NO_SIGNAL at 16:22:33.683 (**~540 ms**, which is the 500 ms staleness window plus one frame). The stream never stopped, at 30 fps throughout |
+| E. Stress: probe force-killed mid-stream 10× (0.45–1.8 s in), writer running | Afterwards a probe streams at 30 fps. Same FrameServer svchost PID before and after, 0 Application Error (1000) events, active-stream count back to 0 every time (fix round 1, after the locking fix) |
 | D. Two consumers at once (two `IMFSourceReader`s) | First consumer: 120 frames LIVE, unaffected. Second consumer: `ReadSample` failed at once with `0xC00D3704` (`MF_E_HW_MFT_FAILED_START_STREAMING`, "in use"). This was a clean error, not a hang |
 
 The probe's saved frames are `spikes/out/*.bmp` (gitignored). They were inspected visually: a grey frame with a white block, and color bars with a moving white bar in the bottom strip.
