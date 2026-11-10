@@ -1,0 +1,31 @@
+name: ios-spike
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'spikes/ios-hello/**'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate --spec spikes/ios-hello/project.yml --project spikes/ios-hello
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project spikes/ios-hello/RaaiCamSpike.xcodeproj -scheme RaaiCamSpike \
+            -configuration Release -sdk iphoneos -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package ipa
+        run: |
+          mkdir Payload
+          cp -r build/Build/Products/Release-iphoneos/RaaiCamSpike.app Payload/
+          zip -r RaaiCamSpike.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RaaiCamSpike-ipa
+          path: RaaiCamSpike.ipa
