@@ -1,0 +1,8 @@
+.superpowers/
+bin/
+obj/
+.vs/
+*.user
+DerivedData/
+build/
+*.ipa
