@@ -9,3 +9,5 @@ build/
 spikes/out/
 *.xcodeproj/
 spikes/_ref/
+*.bmp
+windows/out/
