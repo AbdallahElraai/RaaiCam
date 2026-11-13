@@ -121,6 +121,7 @@ public sealed class Host : ILinkHost
     /// </summary>
     public Task<bool> UnpairAsync()
     {
+        if (!_running) return Task.FromResult(false);
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var ev = new CallEvent(async () =>
         {
@@ -137,8 +138,11 @@ public sealed class Host : ILinkHost
 
     // ---- main loop ----
 
+    volatile bool _running;
+
     public async Task RunAsync(CancellationToken ct)
     {
+        _running = true;
         var decodeThread = new Thread(DecodeLoop) { IsBackground = true, Name = "raaicam-decode" };
         decodeThread.Start();
         using var tickerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -162,6 +166,7 @@ public sealed class Host : ILinkHost
         }
         finally
         {
+            _running = false;
             tickerCts.Cancel();
             try { await ticker.ConfigureAwait(false); } catch (OperationCanceledException) { }
             try { await _links.ShutdownAsync().ConfigureAwait(false); } catch (Exception) { }
@@ -196,7 +201,7 @@ public sealed class Host : ILinkHost
 
     bool Post(HostEvent ev) => _events.Writer.TryWrite(ev);
 
-    bool ILinkHost.Post(Func<Task> work) => Post(new CallEvent(work, null));
+    bool ILinkHost.Post(Func<Task> work, Action? dropped) => Post(new CallEvent(work, dropped));
 
     /// <summary>Test hook: completes once every event posted before this call has been handled by the loop.</summary>
     internal Task FlushAsync()

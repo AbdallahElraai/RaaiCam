@@ -751,4 +751,119 @@ public class LinkManagerTests
         gate.SetResult(late);
         await rig.Obs.Until(() => late.Disposed);
     }
+
+    // ---- fix round 1 ----
+
+    [Fact]
+    public async Task Shutdown_ConnectResultPostedAfterLoopExitIsDisposed()
+    {
+        var rig = new HostRig(wifi: true);
+        var usb = rig.Connector.NewLink();
+        usb.StartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Connector.Script(() => usb);
+        var gate = new TaskCompletionSource<IPhoneLink>(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Wifi!.OnConnectAsync = (_, _) => gate.Task;
+        rig.Consumer.Set(true, 1280, 720);
+        await rig.StartAsync();
+        rig.Wifi.Offer(WifiIp);
+        await rig.Obs.Until(() => rig.Wifi.Attempts.Count == 1);
+
+        rig.Cancel(); // shutdown now waits behind the hung start; the loop itself has already exited
+        await Task.Delay(100);
+        var late = new FakeLink(rig.Obs);
+        gate.SetResult(late);
+        await Task.Delay(100); // result is queued on the dead loop
+        usb.StartGate.SetResult();
+        await rig.Run.WaitAsync(TimeSpan.FromSeconds(10));
+        await rig.Obs.Until(() => late.Disposed);
+    }
+
+    [Fact]
+    public async Task Usb_ConnectIsBoundedTo5s()
+    {
+        await using var rig = new HostRig();
+        rig.Connector.ScriptAsync(async ct =>
+        {
+            await Task.Delay(Timeout.Infinite, ct); // hung usbmux
+            return null;
+        });
+        rig.Consumer.Set(true, 1280, 720);
+        await rig.StartAsync();
+        await rig.StepAsync(48);
+        Assert.Equal(1, rig.Connector.Attempts);
+        await rig.StepAsync(4); // 5 s: the token fires
+        await rig.WaitLogAsync("usb connect failed");
+        await rig.StepAsync(6); // backoff 0.5 s, then a normal attempt
+        await rig.Obs.Until(() => rig.Connector.Attempts == 2);
+        await rig.Obs.Until(() => rig.Connector.Links.Count == 1);
+    }
+
+    [Fact]
+    public async Task Warmup_GivesUpAfter5sWithoutKeyframeAndRetriesLater()
+    {
+        var (rig, usb, wifi) = await BothUpAsync();
+        await using var _ = rig;
+        usb.RaiseDisconnected("cable pulled");
+        await rig.FlushAsync();
+        await rig.Obs.Until(() => rig.Decoders.Created.Count == 2);
+        await rig.StepAsync(6);
+        await rig.Obs.Until(() => rig.Connector.Links.Count == 2 && rig.Connector.Links[1].CountPrefix("start") == 1);
+        var usb2 = rig.Connector.Links[1];
+
+        await rig.StepAsync(40); // never a keyframe; still warming at ~4.5 s
+        Assert.True(usb2.Carrying);
+        await rig.StepAsync(12); // > 5 s since warm-up began
+        await rig.WaitLogAsync("giving up");
+        Assert.False(usb2.Carrying);
+        Assert.Equal("route idle", usb2.Commands[^1]);
+        Assert.True(wifi.Carrying);
+        Assert.Equal("wifi", rig.Host.Status.Link);
+        int starts = usb2.CountPrefix("start");
+
+        await rig.StepAsync(50); // no spam during the 10 s hold-off
+        Assert.Equal(starts, usb2.CountPrefix("start"));
+        Assert.Equal(1, rig.Log.Lines.Count(l => l.Contains("giving up")));
+        await rig.StepAsync(60); // warm-up is tried again
+        await rig.Obs.Until(() => usb2.CountPrefix("start") == starts + 1);
+        Assert.Equal("wifi", rig.Host.Status.Link);
+    }
+
+    [Fact]
+    public async Task Bitrate_LadderHistoryIsClearedAcrossStopAndStart()
+    {
+        var (rig, wifi) = await WifiOnlyAsync();
+        await using var _ = rig;
+        await rig.Obs.Until(() => rig.Decoders.Created.Count == 1);
+        using var entered = new SemaphoreSlim(0);
+        using var gate = new ManualResetEventSlim(false);
+        rig.Decoders.Behavior = (_, seq) =>
+        {
+            if (seq == 1) { entered.Release(); gate.Wait(TimeSpan.FromSeconds(20)); }
+            return VideoDecodeResult.Frame;
+        };
+        try
+        {
+            wifi.RaiseVideo(1, true);
+            Assert.True(await entered.WaitAsync(TimeSpan.FromSeconds(10)));
+            for (uint s = 2; s <= 6; s++) wifi.RaiseVideo(s, false);
+            await rig.FlushAsync();
+            await rig.StepAsync(15); // 1.5 s bad
+
+            rig.Consumer.Inactive();
+            await rig.StepAsync(1);
+            rig.Consumer.Set(true, 1280, 720);
+            await rig.StepAsync(10); // 1.0 s more: 2.5 s in total, but the history was cleared by the restart
+            Assert.Empty(Bitrates(wifi));
+            await rig.StepAsync(20);
+            Assert.Equal(new[] { "bitrate 4000" }, Bitrates(wifi));
+        }
+        finally { gate.Set(); }
+    }
+
+    [Fact]
+    public async Task Unpair_BeforeHostStartedCompletesFalse()
+    {
+        var rig = new HostRig();
+        Assert.False(await rig.Host.UnpairAsync().WaitAsync(TimeSpan.FromSeconds(5)));
+    }
 }

@@ -7,7 +7,7 @@ namespace RaaiCam.Core.Hosting;
 internal interface ILinkHost
 {
     /// <summary>Queues work for the host loop. Returns false when the loop is gone (the work will never run).</summary>
-    bool Post(Func<Task> work);
+    bool Post(Func<Task> work, Action? dropped = null);
     void Log(string line);
     void LogThrottled(string key, string line);
     /// <summary>Disposes the decoder and (w &gt; 0) creates a new one that waits for a keyframe. Never blocks.</summary>
@@ -43,6 +43,9 @@ internal sealed class LinkManager
     static readonly TimeSpan IdleClose = TimeSpan.FromSeconds(10);
     static readonly TimeSpan CommandBound = TimeSpan.FromSeconds(2);
     static readonly TimeSpan WifiConnectBound = TimeSpan.FromSeconds(3);
+    static readonly TimeSpan UsbConnectBound = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan WarmUpCap = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan WarmRetryAfter = TimeSpan.FromSeconds(10);
     static readonly TimeSpan StartRetry = TimeSpan.FromSeconds(1);
     static readonly TimeSpan BrowseRetry = TimeSpan.FromSeconds(5);
     static readonly TimeSpan WarmKeyframeEvery = TimeSpan.FromSeconds(1);
@@ -71,6 +74,8 @@ internal sealed class LinkManager
         public int StartGen;
         public WifiCandidate? Candidate;
         public long? WarmKeyframeAt;
+        public long? WarmStartedAt;
+        public long? WarmRetryAt;
 
         // Connect / backoff state (survives the link).
         public int Failures;
@@ -200,7 +205,7 @@ internal sealed class LinkManager
         var s = _usb;
         s.Connecting = true;
         int gen = ++s.Gen;
-        var cts = ResetConnectCts(s, null);
+        var cts = ResetConnectCts(s, UsbConnectBound);
         Task<IPhoneLink?> t;
         try { t = _usbConnector.ConnectAsync(cts.Token); }
         catch (Exception e) { t = Task.FromException<IPhoneLink?>(e); }
@@ -253,13 +258,19 @@ internal sealed class LinkManager
         else _ = AwaitConnectAsync(s, gen, t);
     }
 
+    static async Task DisposeQuietlyAsync(IPhoneLink link)
+    {
+        try { await link.DisposeAsync().ConfigureAwait(false); } catch (Exception) { }
+    }
+
     async Task AwaitConnectAsync(Slot s, int gen, Task<IPhoneLink?> t)
     {
         IPhoneLink? link = null;
         Exception? err = null;
         try { link = await t.ConfigureAwait(false); }
         catch (Exception e) { err = e; }
-        bool posted = _host.Post(() => { OnConnectResult(s, gen, link, err); return Task.CompletedTask; });
+        bool posted = _host.Post(() => { OnConnectResult(s, gen, link, err); return Task.CompletedTask; },
+            dropped: link is null ? null : () => _ = DisposeQuietlyAsync(link));
         if (!posted && link is not null)
         {
             try { await link.DisposeAsync().ConfigureAwait(false); } catch (Exception) { }
@@ -353,6 +364,14 @@ internal sealed class LinkManager
         else if (s.Kind == LinkKind.Usb && _active.Kind == LinkKind.Wifi && _active.StartW == 0) SetActive(s, now);
     }
 
+    /// <summary>Forgets the bad/stable history (a stop/start or a failed start must not carry old samples across).</summary>
+    void ResetLadderTimers(long now)
+    {
+        _badSince = null;
+        _lastBad = now;
+        _rtts.Clear();
+    }
+
     void SetActive(Slot s, long now)
     {
         _active = s;
@@ -382,6 +401,7 @@ internal sealed class LinkManager
         _lastSeq = null;
         _keyframePending = false;
         _lastKeyframeSent = null;
+        ResetLadderTimers(_time.GetTimestamp());
         RouteTo(s);
         if (restart)
         {
@@ -425,6 +445,7 @@ internal sealed class LinkManager
             if (ok || s.StartGen != gen || s.Link != link) return;
             s.StartW = s.StartH = 0;
             s.Warming = false;
+            ResetLadderTimers(_time.GetTimestamp());
             s.StartRetryAt = _time.GetTimestamp() + (long)(StartRetry.TotalSeconds * _time.TimestampFrequency);
             _host.LogThrottled("start-failed", $"start on {s.Name} failed, will retry");
         });
@@ -447,6 +468,7 @@ internal sealed class LinkManager
         _host.ResetDecoder(0, 0, null);
         _keyframePending = false;
         _lastSeq = null;
+        ResetLadderTimers(_time.GetTimestamp());
         Volatile.Write(ref _targetKbps, 0);
         _host.Log("consumer inactive, stop");
     }
@@ -460,11 +482,24 @@ internal sealed class LinkManager
         if (!u.Warming)
         {
             if (u.StartRetryAt is { } r && now < r) return;
+            if (u.WarmRetryAt is { } wr && now < wr) return;
             u.Warming = true;
             u.WarmKeyframeAt = now;
+            u.WarmStartedAt = now;
             _host.Log("usb is back, warming it up while wifi keeps carrying video");
             RouteWarm(u);
             IssueStart(u, _wantW, _wantH);
+        }
+        else if (u.WarmStartedAt is { } ws && _time.GetElapsedTime(ws, now) >= WarmUpCap)
+        {
+            // No keyframe in 5 s: give up, keep Wi-Fi, try again later (or when USB reconnects, which clears WarmRetryAt).
+            _host.Log("usb warm-up produced no keyframe within 5 s, giving up for now");
+            u.Warming = false;
+            u.Routed = false;
+            u.StartW = u.StartH = 0;
+            u.WarmStartedAt = null;
+            u.WarmRetryAt = now + (long)(WarmRetryAfter.TotalSeconds * _time.TimestampFrequency);
+            Send(u, "route", l => l.SendRouteAsync(false));
         }
         else if ((u.StartW, u.StartH) != want)
         {
@@ -744,6 +779,8 @@ internal sealed class LinkManager
         s.Confirmed = s.Routed = s.Warming = false;
         s.StartW = s.StartH = 0;
         s.StartRetryAt = null;
+        s.WarmRetryAt = null;
+        s.WarmStartedAt = null;
         s.Candidate = null;
         if (fail) Fail(s, _time.GetTimestamp());
         else { s.NextAttempt = null; s.Failures = 0; }
