@@ -14,7 +14,7 @@ if (args.Contains("--list-devices"))
     var usb = new UsbmuxClient();
     IReadOnlyList<UsbDevice> devs;
     try { devs = await usb.ListDevicesAsync(lcts.Token); }
-    catch (Exception e) when (e is UsbmuxUnavailableException or UsbmuxException or OperationCanceledException or IOException)
+    catch (Exception e)
     {
         Console.WriteLine("devices=0");
         Console.WriteLine("app=n/a");
@@ -29,7 +29,7 @@ if (args.Contains("--list-devices"))
         await using var s = await usb.ConnectAsync(devs[0].DeviceId, 47820, lcts.Token);
         app = "reachable";
     }
-    catch (Exception e) when (e is UsbmuxException or UsbmuxUnavailableException or IOException or OperationCanceledException)
+    catch (Exception)
     {
         app = "unreachable";
     }

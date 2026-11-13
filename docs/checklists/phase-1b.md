@@ -8,7 +8,7 @@ Landscape on the stand, USB cable plugged into the PC. The camera is named **Raa
 
 1. On the iPhone, delete the old **RaaiCam Spike** app (press and hold the icon, Remove App, Delete App).
 2. On the PC, open **iloader**, sign in, and choose **Import IPA**.
-3. Pick this file: `D:\RaaiCam\spikes\out\RaaiCam.ipa`
+3. Pick this file: `D:\RaaiCam\spikes\out\RaaiCam.ipa` (Claude already put it there; you do not need to download anything).
 4. On the iPhone, open **RaaiCam**. When it asks for the camera, tap **Allow**. Allow local network too if asked.
 5. Plug the iPhone into the PC with the cable (tap **Trust** if asked).
 6. Check the iPhone screen says **Ready**.
@@ -52,4 +52,4 @@ Logs: `%LOCALAPPDATA%\RaaiCam\logs\` (press Win+R, paste that path, Enter).
 | 3b | Tap **Switch lens** | The view gets wider (ultra-wide). Tap again: back to normal | | |
 | 4 | Press the iPhone side button (lock) during a meeting | The meeting shows the card within 1 second. Unlock the phone and open RaaiCam: video is back within 3 seconds | | |
 | 5 | Unplug the USB cable during a meeting | The meeting shows the card, no error window on the PC. Plug it back in: video is back within 3 seconds | | |
-| 6 | Keep a meeting running for 30 minutes | Note the phone temperature status (Normal / Warm / Hot) at the end, and any stutter or freeze | | Temperature: ____ Stutter: ____ |
+| 6 | Keep a meeting running for 30 minutes | Note the phone temperature word shown in the host line (`thermal=`) at the end, and any stutter or freeze. `nominal` = cool, fine. `fair` = a bit warm, fine. `serious` = hot, the phone may slow down: note it. `critical` = very hot, stop and let it cool | | thermal=____ Stutter: ____ |

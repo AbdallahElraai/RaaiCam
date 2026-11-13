@@ -36,7 +36,8 @@ try { $status = (& $ctlExe status) | Select-Object -Last 1 | ConvertFrom-Json } 
 if (-not $status -or -not $status.cameraPresent) {
   Fail-Preflight 'the RaaiCam virtual camera is not installed' 'Run (as Administrator) powershell -ExecutionPolicy Bypass -File windows\install\dev-install.ps1'
 }
-$dev = (& $hostExe --list-devices) 2>&1 | Out-String
+$dev = ""
+try { $dev = (& $hostExe --list-devices | Out-String) } catch { $dev = "" }
 $devCount = if ($dev -match 'devices=(\d+)') { [int]$Matches[1] } else { 0 }
 $appState = if ($dev -match 'app=(\S+)') { $Matches[1] } else { 'n/a' }
 if ($devCount -lt 1) {
