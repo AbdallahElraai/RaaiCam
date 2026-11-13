@@ -23,6 +23,7 @@ final class PhoneSession: ObservableObject {
     private var desired: StartCommand?
     private var startToken: UInt64 = 0
     private var lastRuntimeRestart = Date.distantPast
+    private var cameraDetailShown = false
     private var snapshot = TelemetrySnapshot()
     private var telemetryTimer: DispatchSourceTimer?
     private var lastTelemetryAt = Date()
@@ -56,11 +57,11 @@ final class PhoneSession: ObservableObject {
             server.onLog = { [weak self] in self?.logThrottled($0) }
             server.onListening = { [weak self] in
                 self?.log("I listening on 47820")
-                self?.publish(state: .waiting)
+                self?.work.async { self?.applyListenerEvent(.waiting) }
             }
             server.onError = { [weak self] msg in
                 self?.log("E server: \(msg)")
-                self?.publish(state: .error(msg))
+                self?.work.async { self?.applyListenerEvent(.error(msg)) }
             }
             server.onRejectedPeer = { [weak self] peer in
                 self?.log("W rejected non-loopback peer \(peer)")
@@ -99,6 +100,16 @@ final class PhoneSession: ObservableObject {
     }
 
     // MARK: server events (work queue)
+
+    /// A listener (re)bind or failure says nothing about an attached client, so while one is attached
+    /// the connected/streaming state must stand. Returns nil when the event is to be ignored.
+    static func stateAfterListenerEvent(_ event: SessionState, clientAttached: Bool) -> SessionState? {
+        clientAttached ? nil : event
+    }
+
+    private func applyListenerEvent(_ event: SessionState) {
+        if let s = Self.stateAfterListenerEvent(event, clientAttached: connected) { publish(state: s) }
+    }
 
     private func clientConnected(_ gen: UInt64) {
         currentGen = gen
@@ -177,6 +188,7 @@ final class PhoneSession: ObservableObject {
         case .runtimeError(let msg):
             log("E camera runtime error: \(msg)")
             publish(detail: "Camera error")
+            cameraDetailShown = true
             if connected, !paused, let d = desired, Date().timeIntervalSince(lastRuntimeRestart) > 5 {
                 lastRuntimeRestart = Date()
                 work.asyncAfter(deadline: .now() + 1) { [self] in
@@ -186,9 +198,11 @@ final class PhoneSession: ObservableObject {
         case .interrupted(let reason):
             log("W camera interrupted (\(reason))")
             publish(detail: "Camera interrupted")
+            cameraDetailShown = true
         case .interruptionEnded:
             log("I camera interruption ended")
             publish(detail: "")
+            cameraDetailShown = false
             if connected, !paused, let d = desired { beginCapture(d) }
         }
     }
@@ -241,6 +255,8 @@ final class PhoneSession: ObservableObject {
                         switch result {
                         case .success(let started):
                             self.snapshot.lens = started.lens
+                            // a successful (re)start clears a stale "Camera error"/"interrupted" note
+                            if self.cameraDetailShown { self.cameraDetailShown = false; self.publish(detail: "") }
                             self.lock.lock(); self.active?.fps = started.fps; self.lock.unlock()
                             self.log("I capture started \(d.width)x\(d.height) \(started.lens.rawValue) \(started.fps)fps")
                         case .failure(let error):
