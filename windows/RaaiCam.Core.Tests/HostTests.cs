@@ -38,6 +38,7 @@ sealed class FakeLink(Observed obs) : IPhoneLink
     public event Action<string>? Disconnected;
 
     public HelloInfo? Phone { get; set; } = new(2, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
+    public byte[]? PhoneStaticKey { get; set; } = new byte[32];
     public double? RttMs { get; set; } = 3.0;
     public long? OffsetUs { get; set; } = 0;
     public volatile bool Disposed;
@@ -59,6 +60,7 @@ sealed class FakeLink(Observed obs) : IPhoneLink
 
     public Task StopAsync() { Add("stop"); return Task.CompletedTask; }
     public Task RequestKeyframeAsync() { Add("keyframe"); return Task.CompletedTask; }
+    public Task SendRouteAsync(bool video) { Add(video ? "route video" : "route idle"); return Task.CompletedTask; }
 
     public ValueTask DisposeAsync()
     {

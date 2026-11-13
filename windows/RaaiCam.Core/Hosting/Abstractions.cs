@@ -21,8 +21,10 @@ public interface IPhoneLink : IAsyncDisposable
     event Action<Telemetry>? TelemetryReceived;
     event Action<string>? Disconnected;
 
-    /// <summary>Null until the phone's HELLO has been received.</summary>
+    /// <summary>Null until the phone's INFO frame has been received over the sealed channel (key confirmation).</summary>
     HelloInfo? Phone { get; }
+    /// <summary>The phone static public key (32 bytes); null until the link is confirmed. Identifies the phone across links.</summary>
+    byte[]? PhoneStaticKey { get; }
     double? RttMs { get; }
     /// <summary>Converts a phone capture timestamp to the PC clock (same timebase as the host's qpc), or null before clock sync.</summary>
     long? ToPcUs(ulong phoneUs);
@@ -31,6 +33,8 @@ public interface IPhoneLink : IAsyncDisposable
     Task StartAsync(int width, int height);
     Task StopAsync();
     Task RequestKeyframeAsync();
+    /// <summary>Tells the phone to start or stop streaming video over this link (sealed CMD route).</summary>
+    Task SendRouteAsync(bool video);
 }
 
 public interface IPhoneConnector

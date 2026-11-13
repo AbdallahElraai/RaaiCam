@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using RaaiCam.Core.Hosting;
+using RaaiCam.Core.Pairing;
 using RaaiCam.Core.Phone;
 using RaaiCam.Core.Usbmux;
 using RaaiCam.HostApp;
@@ -48,7 +49,8 @@ var ct = cts.Token;
 var log = new FileLogSink();
 using var sink = new VirtualCameraSink();
 var adapter = new SinkAdapter(sink);
-var host = new Host(adapter, new UsbPhoneConnector(new UsbmuxClient(), log), new H264DecoderFactory(), adapter,
+var store = new PairingStore(PairingStore.DefaultPath, new DpapiDataProtector(), log);
+var host = new Host(adapter, new UsbPhoneConnector(new UsbmuxClient(), log, store), new H264DecoderFactory(), adapter,
     Stopwatch.GetTimestamp, log);
 
 Console.WriteLine("raaicam-host: running, Ctrl+C to exit.");

@@ -144,6 +144,18 @@ public class PairingTests
         }
     }
 
+    [Fact]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public void Dpapi_RoundTripAndWrongDataRejected()
+    {
+        var p = new DpapiDataProtector();
+        var plain = new byte[] { 9, 8, 7, 6, 5 };
+        var blob = p.Protect(plain);
+        Assert.False(blob.AsSpan().IndexOf(plain) >= 0);
+        Assert.Equal(plain, p.Unprotect(blob));
+        Assert.ThrowsAny<CryptographicException>(() => p.Unprotect(new byte[] { 1, 2, 3, 4 }));
+    }
+
     static Dictionary<string, string> Query(string url)
     {
         Assert.StartsWith("raaicam://pair?", url);

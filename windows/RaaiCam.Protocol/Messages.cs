@@ -31,6 +31,16 @@ public sealed record LensCmd(string Lens)
     [JsonPropertyOrder(-1)] public string Cmd => "lens";
 }
 
+public sealed record RouteCmd(bool Video)
+{
+    [JsonPropertyOrder(-1)] public string Cmd => "route";
+}
+
+public sealed record UnpairCmd
+{
+    [JsonPropertyOrder(-1)] public string Cmd => "unpair";
+}
+
 public sealed record Telemetry(
     string Thermal, double Battery, bool Charging, bool Streaming, int Width, int Height,
     double FpsCapture, double FpsEncode, int BitrateKbps, string Lens, bool Paused);
@@ -61,6 +71,18 @@ public static class Messages
         if (h is null) throw new ProtocolException("empty HELLO");
         if (h.Proto != ProtoVersion) throw new ProtocolException($"unsupported proto {h.Proto}");
         return new HelloInfo(h.Proto, h.Role ?? "");
+    }
+
+    sealed record InfoWire(string? App, string? Version, string? Device, string? Os);
+
+    /// <summary>Parses the encrypted INFO frame (sent by the phone as its first sealed frame) into a HelloInfo.</summary>
+    public static HelloInfo ParseInfo(ReadOnlySpan<byte> payload)
+    {
+        InfoWire? i;
+        try { i = JsonSerializer.Deserialize<InfoWire>(payload, Json); }
+        catch (JsonException e) { throw new ProtocolException("invalid INFO json", e); }
+        if (i is null) throw new ProtocolException("empty INFO");
+        return new HelloInfo(ProtoVersion, "phone", i.App ?? "", i.Version ?? "", i.Device ?? "", i.Os ?? "");
     }
 
     public static byte[] Cmd(object cmd) => JsonSerializer.SerializeToUtf8Bytes(cmd, cmd.GetType(), Json);

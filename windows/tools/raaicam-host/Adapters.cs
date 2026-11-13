@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using RaaiCam.Core.Hosting;
+using RaaiCam.Core.Pairing;
 using RaaiCam.Core.Phone;
 using RaaiCam.Core.Usbmux;
 using RaaiCam.Media;
@@ -62,27 +63,40 @@ sealed class PhoneLink(PhoneSession session) : IPhoneLink
     }
 
     public HelloInfo? Phone => session.Phone;
+    public byte[]? PhoneStaticKey => session.PhoneStaticKey;
     public double? RttMs => session.Clock.RttMs;
     public long? ToPcUs(ulong phoneUs) => session.Clock.ToPcUs(phoneUs);
     public Task RunAsync(CancellationToken ct) => session.RunAsync(ct);
     public Task StartAsync(int width, int height) => session.StartAsync(width, height);
     public Task StopAsync() => session.StopAsync();
     public Task RequestKeyframeAsync() => session.RequestKeyframeAsync();
+    public Task SendRouteAsync(bool video) => session.SendRouteAsync(video);
     public ValueTask DisposeAsync() => session.DisposeAsync();
 }
 
-/// <summary>usbmux list -> first USB device -> tunnel to the phone app's port.</summary>
-sealed class UsbPhoneConnector(UsbmuxClient usbmux, ILogSink log) : IPhoneConnector
+/// <summary>
+/// usbmux list -> first USB device -> tunnel to the phone app's port, then the authenticated v2 handshake in paired mode.
+/// Without a paired phone there is nothing to connect to (pairing arrives with the CLI in a later task).
+/// </summary>
+sealed class UsbPhoneConnector(UsbmuxClient usbmux, ILogSink log, PairingStore store) : IPhoneConnector
 {
     const ushort PhonePort = 47820;
+    int _notPairedLogged;
 
     public async Task<IPhoneLink?> ConnectAsync(CancellationToken ct)
     {
+        if (store.Phone is not { } paired)
+        {
+            if (Interlocked.Exchange(ref _notPairedLogged, 1) == 0)
+                log.Write("pc", "no phone is paired; not connecting");
+            return null;
+        }
         var devices = await usbmux.ListDevicesAsync(ct);
         if (devices.Count == 0) return null;
         var stream = await usbmux.ConnectAsync(devices[0].DeviceId, PhonePort, ct);
         // PhoneSession timebase must match the host's qpc: microseconds of Stopwatch time.
-        var session = new PhoneSession(stream, () => (ulong)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency)), log);
+        var session = new PhoneSession(stream, () => (ulong)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency)), log,
+            new SecureLinkOptions(store.GetOrCreateIdentity(), store, paired, null));
         return new PhoneLink(session);
     }
 }

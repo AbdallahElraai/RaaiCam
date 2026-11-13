@@ -118,3 +118,9 @@ WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEM
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+## QRCoder
+
+- Source: NuGet package `QRCoder` 1.6.0 (https://github.com/codebude/QRCoder), referenced (not vendored) by `RaaiCam.Core`.
+- Used for: rendering the pairing QR code as console text (`PairingQr.ToConsoleString`).
+- License: MIT. Copyright (c) 2013-2024 Raffael Herrmann and contributors.

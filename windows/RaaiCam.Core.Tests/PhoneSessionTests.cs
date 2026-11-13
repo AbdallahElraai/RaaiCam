@@ -134,6 +134,8 @@ sealed class Harness : IAsyncDisposable
         Assert.Equal(FrameType.Auth, a3.Type);
         resp.ReadAuth3(a3.Payload.ToArray());
         Chan = new SealedChannel(resp.Keys, isInitiator: false);
+        // The PC logs this after it armed the 5 s confirmation timer; tests that advance the fake clock rely on it.
+        await Sink.WaitForAsync("pc", "authenticated; awaiting INFO");
     }
 
     public Task SendInfoAsync(string json = InfoJson) => SendAsync(FrameType.Info, Encoding.UTF8.GetBytes(json));
