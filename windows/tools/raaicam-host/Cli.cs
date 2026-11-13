@@ -97,6 +97,7 @@ static class HostCli
         });
 
         PairedPhone? phone;
+        bool cancelled = false;
         try
         {
             phone = await PairingWaiter.WaitAsync(session, routes, time, ct,
@@ -104,8 +105,8 @@ static class HostCli
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("Pairing cancelled.");
-            return ExitCodes.Failed;
+            cancelled = true;
+            phone = null;
         }
         finally
         {
@@ -113,6 +114,20 @@ static class HostCli
             await tick;
         }
 
+        // A phone may have been stored just as we gave up (race between the handshake finishing and the wait ending).
+        if (phone is null)
+        {
+            try
+            {
+                if (store.Phone is { } saved && (existing is null || saved.PairedAt > existing.PairedAt)) phone = saved;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+        if (phone is null && cancelled)
+        {
+            Console.WriteLine("Pairing cancelled.");
+            return ExitCodes.Failed;
+        }
         if (phone is null)
         {
             Console.WriteLine("Pairing timed out: no phone paired within 5 minutes. Run raaicam-host --pair to try again.");
@@ -141,7 +156,9 @@ static class HostCli
     internal static async Task<PairedPhone?> PairOverAsync(Stream transport, ILogSink log, PairingStore store, PcIdentity id,
         PairingSession session, CancellationToken ct)
     {
-        var ps = new PhoneSession(transport, NowUs, log, new SecureLinkOptions(id, store, null, session));
+        PhoneSession ps;
+        try { ps = new PhoneSession(transport, NowUs, log, new SecureLinkOptions(id, store, null, session)); }
+        catch { await transport.DisposeAsync(); throw; }
         var result = new TaskCompletionSource<PairedPhone?>(TaskCreationOptions.RunContinuationsAsynchronously);
         ps.Paired += p => result.TrySetResult(p);
         ps.Disconnected += _ => result.TrySetResult(null);
@@ -202,7 +219,10 @@ static class HostCli
             var devices = await usb.ListDevicesAsync(limit.Token);
             if (devices.Count == 0) return false;
             var stream = await usb.ConnectAsync(devices[0].DeviceId, PhonePort, limit.Token);
-            await using var link = PhoneLinks.Create(stream, log, store, paired);
+            PhoneLink created;
+            try { created = PhoneLinks.Create(stream, log, store, paired); }
+            catch { await stream.DisposeAsync(); throw; }
+            await using var link = created;
             bool gone = false;
             link.Disconnected += _ => gone = true;
             _ = link.RunAsync(limit.Token);
@@ -212,8 +232,10 @@ static class HostCli
                 await Task.Delay(50, limit.Token);
             }
             await link.UnpairAsync();
-            await Task.Delay(500, limit.Token); // let the frame leave before the link is closed
-            return !gone;
+            // Success once the command went out. The phone closes the link itself right after handling it, so a close
+            // from here on is expected, not a failure. Short delay so the frame is flushed before we dispose.
+            try { await Task.Delay(300, limit.Token); } catch (OperationCanceledException) { }
+            return true;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -275,7 +297,7 @@ sealed class WifiPairingRoute : IAsyncDisposable
                     connectCts.CancelAfter(TimeSpan.FromSeconds(5));
                     await client.ConnectAsync(addr, port, connectCts.Token);
                 }
-                var phone = await HostCli.PairOverAsync(client.GetStream(), _log, _store, _id, _session, ct); // the session owns the socket now
+                var phone = await HostCli.PairOverAsync(client.GetStream(), _log, _store, _id, _session, ct);
                 if (phone is not null)
                 {
                     try { _settings.SetLastPhoneIp(addr); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
@@ -284,8 +306,11 @@ sealed class WifiPairingRoute : IAsyncDisposable
             }
             catch (Exception e) when (e is not OperationCanceledException || !ct.IsCancellationRequested)
             {
-                client.Dispose();
                 _log.Write("pc", "pairing wifi attempt failed: " + e.GetType().Name);
+            }
+            finally
+            {
+                client.Dispose(); // also on cancellation; the session has already disposed the stream on the normal path
             }
         }
         return null;

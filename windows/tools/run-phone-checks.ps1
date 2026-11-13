@@ -154,6 +154,9 @@ function Wait-Enter($msg) {
   Pump-Status
 }
 
+# Observe host status lines for a fixed time (instead of sleeping blind).
+function Pump-For([double]$sec) { $end = (Get-Date).AddSeconds($sec); while ((Get-Date) -lt $end) { Pump-Status; Start-Sleep -Milliseconds 100 }; Pump-Status }
+
 function Start-HostProc {
   $script:hostProc = Start-Process -FilePath $hostExe -RedirectStandardOutput $hostOut -RedirectStandardError $hostErr -WindowStyle Hidden -PassThru
   $script:bg += $script:hostProc
@@ -291,8 +294,7 @@ try {
     $obsMark = $script:obs.Count
     Wait-Enter 'UNPLUG THE USB CABLE NOW, then press Enter.'
     TL 'owner pressed Enter (cable unplugged)'
-    Start-Sleep -Seconds 6
-    Pump-Status
+    Pump-For 6
     $closed = @(New-LogLines | Where-Object { $_ -match '\[host\] phone link closed \(usb\)' } | ForEach-Object { Parse-LogTime $_ } | Where-Object { $_ -and $_ -ge $promptAt.AddSeconds(-1) })
     if ($closed.Count -eq 0) {
       Add-Result 'F1a' 'FAIL' 'the host never reported the USB link closing: was the cable really unplugged?'
@@ -303,13 +305,17 @@ try {
       if ($after.Count -eq 0) {
         Add-Result 'F1a' 'FAIL' 'no host status lines after the USB loss'
       } else {
-        $first = $after[0]
+        # Status lines stamped just after the loss can still be the pre-loss "link=usb" line; measure to the first one that is not usb.
+        $post = @($after | Where-Object { $_.S.Link -ne 'usb' })
+        if ($post.Count -eq 0) { $post = @($after | Select-Object -Last 1) }
+        $first = $post[0]
+        $afterFirst = @($after | Where-Object { $_.T -ge $first.T })
         $delay = ($first.T - $closeT).TotalSeconds
-        $nones = @($after | Select-Object -First 6 | Where-Object { $_.S.Link -ne 'wifi' })
+        $nones = @($afterFirst | Select-Object -First 6 | Where-Object { $_.S.Link -ne 'wifi' })
         TL ("first status after the loss: link={0} standby={1} seen {2:N2} s after the loss" -f $first.S.Link, $first.S.Standby, $delay)
         $ok = $first.S.Link -eq 'wifi' -and $delay -le 1.3 -and $nones.Count -eq 0
         Add-Result 'F1a' $(if ($ok) { 'PASS' } else { 'FAIL' }) ("first status line after the cable loss: link=$($first.S.Link), $([Math]::Round($delay, 2)) s after the host noticed (limit 1.3 s incl. the 1 s status interval); of the next 6 status lines not on wifi: $($nones.Count)")
-        $moving = @($after | Select-Object -Skip 2 -First 3 | Where-Object { $_.S.In -ge 15 })
+        $moving = @($afterFirst | Select-Object -Skip 1 -First 3 | Where-Object { $_.S.In -ge 15 })
         Add-Result 'F1b' $(if ($moving.Count -ge 2) { 'PASS' } else { 'FAIL' }) "video still arriving 2-5 s after the unplug (status in>=15 on $($moving.Count) of 3 lines)"
       }
     }
@@ -328,13 +334,16 @@ try {
     if (-not $back) {
       Add-Result 'F1d' 'FAIL' 'link=usb standby=wifi did not come back within 30 s of plugging in. Check the cable, that the phone is unlocked and RaaiCam is open.'
     } else {
-      $usbBackT = if ($warm.Count -gt 0) { $warm[0] } else { $promptAt2 }
-      $took = ($back.T - $usbBackT).TotalSeconds
-      TL ("link=usb standby=wifi seen {0:N1} s after the host saw USB come back" -f $took)
-      Add-Result 'F1d' $(if ($took -le 10) { 'PASS' } else { 'FAIL' }) "link=usb standby=wifi again $([Math]::Round($took, 1)) s after USB came back (limit 10 s)"
+      if ($warm.Count -eq 0) {
+        TL 'link=usb standby=wifi seen, but the host log has no "usb is back" line to time it from'
+        Add-Result 'F1d' 'WARN' 'link=usb standby=wifi came back, but the host log has no "usb is back" line, so the 10 s limit could not be timed. Tell Claude.'
+      } else {
+        $took = ($back.T - $warm[0]).TotalSeconds
+        TL ("link=usb standby=wifi seen {0:N1} s after the host saw USB come back" -f $took)
+        Add-Result 'F1d' $(if ($took -le 10) { 'PASS' } else { 'FAIL' }) "link=usb standby=wifi again $([Math]::Round($took, 1)) s after USB came back (limit 10 s)"
+      }
     }
-    Start-Sleep -Seconds 4
-    Pump-Status
+    Pump-For 4
     $trans = Probe-Transitions $pr.Log
     $drops2 = @(Card-Drops $trans $promptAt2.AddSeconds(-1) (Get-Date))
     Add-Result 'F1e' $(if ($drops2.Count -eq 0) { 'PASS' } else { 'FAIL' }) $(if ($drops2.Count -eq 0) { 'no placeholder card frames in the camera during the switch back to USB' } else { "the camera showed the placeholder card $($drops2.Count) time(s) while switching back to USB" })
