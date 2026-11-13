@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>raaicam-host</AssemblyName>
+    <RootNamespace>RaaiCam.HostApp</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\RaaiCam.Core\RaaiCam.Core.csproj" />
+    <ProjectReference Include="..\..\RaaiCam.Media\RaaiCam.Media.csproj" />
+  </ItemGroup>
+</Project>

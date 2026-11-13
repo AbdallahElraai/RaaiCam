@@ -19,6 +19,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RaaiCam.Core", "RaaiCam.Cor
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RaaiCam.Core.Tests", "RaaiCam.Core.Tests\RaaiCam.Core.Tests.csproj", "{F5740CF7-46E5-425E-BE88-2C7B84956FAF}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "raaicam-host", "tools\raaicam-host\raaicam-host.csproj", "{76200097-77D0-499D-B7AF-2642298F850E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -113,11 +115,24 @@ Global
 		{F5740CF7-46E5-425E-BE88-2C7B84956FAF}.Release|x64.Build.0 = Release|Any CPU
 		{F5740CF7-46E5-425E-BE88-2C7B84956FAF}.Release|x86.ActiveCfg = Release|Any CPU
 		{F5740CF7-46E5-425E-BE88-2C7B84956FAF}.Release|x86.Build.0 = Release|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Debug|x64.Build.0 = Debug|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Debug|x86.Build.0 = Debug|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Release|x64.ActiveCfg = Release|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Release|x64.Build.0 = Release|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Release|x86.ActiveCfg = Release|Any CPU
+		{76200097-77D0-499D-B7AF-2642298F850E}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{AF4B2024-9390-4BE1-B836-335EA22A4F8E} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
+		{76200097-77D0-499D-B7AF-2642298F850E} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
 	EndGlobalSection
 EndGlobal

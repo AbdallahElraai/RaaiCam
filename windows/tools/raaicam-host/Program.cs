@@ -1,0 +1,49 @@
+using System.Diagnostics;
+using System.Globalization;
+using RaaiCam.Core.Hosting;
+using RaaiCam.Core.Phone;
+using RaaiCam.Core.Usbmux;
+using RaaiCam.HostApp;
+using RaaiCam.Media;
+
+// raaicam-host: phone (USB) -> H.264 decoder -> RaaiCam virtual camera.
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    try { cts.Cancel(); } catch (ObjectDisposedException) { }
+};
+var ct = cts.Token;
+
+var log = new FileLogSink();
+using var sink = new VirtualCameraSink();
+var adapter = new SinkAdapter(sink);
+var host = new Host(adapter, new UsbPhoneConnector(new UsbmuxClient(), log), new H264DecoderFactory(), adapter,
+    Stopwatch.GetTimestamp, log);
+
+Console.WriteLine("raaicam-host: running, Ctrl+C to exit.");
+var run = host.RunAsync(ct);
+while (!run.IsCompleted)
+{
+    try { await Task.WhenAny(run, Task.Delay(1000, ct)); }
+    catch (OperationCanceledException) { }
+    if (run.IsCompleted) break;
+    Console.WriteLine(FormatStatus(host.Status));
+}
+try { await run; }
+catch (OperationCanceledException) { }
+Console.WriteLine("raaicam-host: stopped.");
+return 0;
+
+static string FormatStatus(HostStatus s)
+{
+    var ic = CultureInfo.InvariantCulture;
+    string consumer = s.ConsumerWidth > 0 ? $"{s.ConsumerWidth}x{s.ConsumerHeight}" : "inactive";
+    string lat = s.LatencyP50Ms is { } p50 && s.LatencyP95Ms is { } p95
+        ? string.Create(ic, $"{p50:F0}/{p95:F0}ms") : "-/-ms";
+    string rtt = s.RttMs is { } r ? string.Create(ic, $"{r:F0}ms") : "-";
+    string rate = s.BitrateMbps is { } b ? string.Create(ic, $"{b:F1}Mbps") : "-";
+    string batt = s.BatteryPercent is { } p ? $"{p}%{(s.Charging == true ? "+" : "")}" : "-";
+    return string.Create(ic,
+        $"link={s.Link} phone={s.Phone ?? "-"} consumer={consumer} in={s.FpsIn:F1} out={s.FpsOut:F1} lat={lat} rtt={rtt} {rate} thermal={s.Thermal ?? "-"} batt={batt}");
+}
