@@ -6,60 +6,48 @@ using RaaiCam.Protocol;
 namespace RaaiCam.Core.Hosting;
 
 /// <summary>
-/// Wires the virtual camera's consumer state, the USB phone link, the H.264 decoder and the frame sink together.
+/// Wires the virtual camera's consumer state, the phone links (USB and Wi-Fi, see <see cref="LinkManager"/>), the H.264
+/// decoder and the frame sink together.
 /// <para>
 /// Threading model. One loop (<see cref="RunAsync"/>) owns all state transitions and reads a single unbounded
 /// <c>Channel&lt;HostEvent&gt;</c>. Everything that happens elsewhere is only ever turned into an event and posted
 /// (never awaited, never blocked on): the 100 ms ticker, session <c>Video</c>/<c>TelemetryReceived</c>/<c>Disconnected</c>
-/// handlers, and keyframe requests raised by the decoder. Decoding happens on one dedicated thread fed by its own
-/// <c>Channel</c>; that thread creates, uses and disposes every decoder, and writes decoded frames to the sink.
+/// handlers, connect results and keyframe requests raised by the decoder. Decoding happens on one dedicated thread fed by
+/// its own <c>Channel</c>; that thread creates, uses and disposes every decoder, and writes decoded frames to the sink.
 /// </para>
 /// <para>
-/// Phone discovery uses connect-retry polling (every 1 s while the consumer is active), not usbmux Listen, so
-/// a dropped or reset daemon connection needs no special handling: the next attempt simply starts over.
+/// Phone discovery uses connect-retry polling with a 0.5 s to 5 s backoff (USB through usbmux, Wi-Fi through discovery
+/// candidates), not usbmux Listen, so a dropped or reset daemon connection needs no special handling.
 /// </para>
 /// </summary>
-public sealed class Host
+public sealed class Host : ILinkHost
 {
     static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(100);
-    static readonly TimeSpan ConnectRetry = TimeSpan.FromSeconds(1);
-    static readonly TimeSpan KeyframeMinInterval = TimeSpan.FromSeconds(1);
-    static readonly TimeSpan IdleClose = TimeSpan.FromSeconds(10);
-    static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(2);
+    static readonly TimeSpan DecoderRetry = TimeSpan.FromSeconds(1);
     static readonly TimeSpan LogThrottle = TimeSpan.FromSeconds(5);
     const int MaxQueuedFrames = 3;
 
     readonly IConsumerSource _consumer;
-    readonly IPhoneConnector _connector;
     readonly IDecoderFactory _decoders;
     readonly IFrameSink _sink;
     readonly Func<long> _qpcNow;
     readonly long _qpcFreq;
     readonly ILogSink _log;
     readonly TimeProvider _time;
+    readonly LinkManager _links;
 
     // Host loop mailbox, and the decode thread's own queue.
     readonly Channel<HostEvent> _events = Channel.CreateUnbounded<HostEvent>(new() { SingleReader = true });
     readonly Channel<DecodeItem> _decodeQ = Channel.CreateUnbounded<DecodeItem>(new() { SingleReader = true });
 
-    // Loop-owned state (only touched from RunAsync's loop).
-    bool _ready;                 // phone HELLO seen on the current link
-    int _streamW, _streamH;      // size sent in the last start command; 0 = not streaming
-    long? _idleSince;
-    long? _lastConnectAttempt;
-    long? _lastKeyframeSent;
-    bool _keyframePending;
-    uint? _lastSeq;
-    int _linkNo;
-
     // Shared with other threads.
-    volatile IPhoneLink? _link;
-    Task _linkRun = Task.CompletedTask;
     Telemetry? _telemetry;
     int _reqW, _reqH;
     int _decodeBacklog;          // items in _decodeQ not yet taken by the decode thread (Channel.Count is unsupported here)
-    int _epoch;                // bumped whenever the decode pipeline is reset
+    int _epoch;                  // bumped whenever the decode pipeline is reset
     long _wantSize;              // (w << 32) | h the sink may currently receive; 0 = none
+    long _createFailedAt = long.MinValue;   // fake/real timestamp of the last decoder create failure, MinValue = none
+    int _createFailedEpoch = -1;
 
     readonly SampleWindow _fpsIn;
     readonly SampleWindow _fpsOut;
@@ -70,11 +58,17 @@ public sealed class Host
     /// <summary>Test hook: invoked after each poll tick has been fully processed.</summary>
     internal Action? OnTickProcessed { get; set; }
 
+    /// <summary>Test hook: invoked once the ticker's next 100 ms delay has been armed.</summary>
+    internal Action? OnTickerArmed { get; set; }
+
+    /// <param name="wifi">Wi-Fi side (discovery plus connect); null = USB only.</param>
+    /// <param name="pairedKey">The paired phone's static public key; phones with another key are ignored.
+    /// A null function or a null result accepts any confirmed phone. A throwing function means "cannot verify": the phone is dropped.</param>
     public Host(IConsumerSource consumer, IPhoneConnector connector, IDecoderFactory decoders, IFrameSink sink,
-        Func<long> qpcNow, ILogSink log, TimeProvider? time = null, long qpcFrequency = 0)
+        Func<long> qpcNow, ILogSink log, TimeProvider? time = null, long qpcFrequency = 0,
+        IWifiConnector? wifi = null, Func<byte[]?>? pairedKey = null)
     {
         _consumer = consumer;
-        _connector = connector;
         _decoders = decoders;
         _sink = sink;
         _qpcNow = qpcNow;
@@ -84,6 +78,7 @@ public sealed class Host
         _fpsIn = new SampleWindow(_qpcFreq);
         _fpsOut = new SampleWindow(_qpcFreq);
         _latency = new SampleWindow(_qpcFreq);
+        _links = new LinkManager(connector, wifi, pairedKey ?? (() => null), _time, this);
     }
 
     // ---- status ----
@@ -92,30 +87,53 @@ public sealed class Host
     {
         get
         {
-            var link = _link;
+            var snap = _links.Current;
             var tel = Volatile.Read(ref _telemetry);
             long now = _qpcNow();
             var lat = _latency.Snapshot(now);
             lat.Sort();
             return new HostStatus(
-                Link: link is null ? "none" : "usb",
-                Phone: link?.Phone?.Device,
+                Link: snap.Link,
+                Phone: snap.Phone,
                 ConsumerWidth: Volatile.Read(ref _reqW),
                 ConsumerHeight: Volatile.Read(ref _reqH),
                 FpsIn: _fpsIn.Snapshot(now).Count,
                 FpsOut: _fpsOut.Snapshot(now).Count,
                 LatencyP50Ms: Percentile(lat, 0.50),
                 LatencyP95Ms: Percentile(lat, 0.95),
-                RttMs: link?.RttMs,
+                RttMs: snap.Active?.RttMs,
                 BitrateMbps: tel is null ? null : tel.BitrateKbps / 1000.0,
                 Thermal: tel?.Thermal,
                 BatteryPercent: tel is null ? null : (int)Math.Round(tel.Battery * 100),
-                Charging: tel?.Charging);
+                Charging: tel?.Charging,
+                Standby: snap.Standby,
+                TargetBitrateKbps: snap.Link == "none" ? 0 : _links.TargetKbps,
+                DroppedStandbyFrames: _links.DroppedStandbyFrames);
         }
     }
 
     static double? Percentile(List<double> sorted, double p) =>
         sorted.Count == 0 ? null : sorted[Math.Max(0, (int)Math.Ceiling(p * sorted.Count) - 1)];
+
+    /// <summary>
+    /// Unpairs the phone of the video-carrying link (sealed unpair command + local store update), then closes both links.
+    /// False (with a log line) when no confirmed link exists or the store fails. Completes false if the host is not running.
+    /// </summary>
+    public Task<bool> UnpairAsync()
+    {
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ev = new CallEvent(async () =>
+        {
+            try { tcs.TrySetResult(await _links.UnpairAsync().ConfigureAwait(false)); }
+            catch (Exception e)
+            {
+                LogThrottled("unpair", $"unpair failed: {e.GetType().Name}");
+                tcs.TrySetResult(false);
+            }
+        }, () => tcs.TrySetResult(false));
+        if (!_events.Writer.TryWrite(ev)) tcs.TrySetResult(false);
+        return tcs.Task;
+    }
 
     // ---- main loop ----
 
@@ -135,7 +153,7 @@ public sealed class Host
                 try { ev = await reader.ReadAsync(ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { break; }
 
-                try { await HandleAsync(ev, ct).ConfigureAwait(false); }
+                try { await HandleAsync(ev).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                 catch (Exception e) { LogThrottled("loop", $"host loop error: {e.GetType().Name}: {e.Message}"); }
 
@@ -146,7 +164,10 @@ public sealed class Host
         {
             tickerCts.Cancel();
             try { await ticker.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            await ShutdownAsync().ConfigureAwait(false);
+            try { await _links.ShutdownAsync().ConfigureAwait(false); } catch (Exception) { }
+            _events.Writer.TryComplete();
+            while (_events.Reader.TryRead(out var left))
+                if (left is CallEvent c) c.Dropped?.Invoke();
             _decodeQ.Writer.TryComplete();
             decodeThread.Join(TimeSpan.FromSeconds(5));
             HostLog("host stopped");
@@ -165,13 +186,17 @@ public sealed class Host
             while (!ct.IsCancellationRequested)
             {
                 Post(new TickEvent());
-                await Task.Delay(PollInterval, _time, ct).ConfigureAwait(false);
+                var delay = Task.Delay(PollInterval, _time, ct);
+                try { OnTickerArmed?.Invoke(); } catch (Exception) { }
+                await delay.ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { }
     }
 
-    void Post(HostEvent ev) => _events.Writer.TryWrite(ev);
+    bool Post(HostEvent ev) => _events.Writer.TryWrite(ev);
+
+    bool ILinkHost.Post(Func<Task> work) => Post(new CallEvent(work, null));
 
     /// <summary>Test hook: completes once every event posted before this call has been handled by the loop.</summary>
     internal Task FlushAsync()
@@ -181,26 +206,20 @@ public sealed class Host
         return b.Done.Task;
     }
 
-    async Task HandleAsync(HostEvent ev, CancellationToken ct)
+    async Task HandleAsync(HostEvent ev)
     {
         switch (ev)
         {
             case TickEvent:
                 PollConsumer();
-                await ReconcileAsync(ct).ConfigureAwait(false);
+                _links.OnTick(_active, _wantW, _wantH);
+                RetryDecoderIfNeeded();
                 break;
-            case VideoEvent v when ReferenceEquals(v.Link, _link):
-                await OnVideoAsync(v.Frame).ConfigureAwait(false);
-                break;
-            case TelemetryEvent t when ReferenceEquals(t.Link, _link):
-                Volatile.Write(ref _telemetry, t.Telemetry);
-                break;
-            case DisconnectedEvent d when ReferenceEquals(d.Link, _link):
-                HostLog("phone link closed: " + d.Reason);
-                await TeardownLinkAsync().ConfigureAwait(false);
+            case CallEvent c:
+                await c.Work().ConfigureAwait(false);
                 break;
             case KeyframeWantedEvent:
-                await SendKeyframeAsync().ConfigureAwait(false);
+                _links.RequestKeyframe(false);
                 break;
             case BarrierEvent b:
                 b.Done.TrySetResult();
@@ -208,7 +227,7 @@ public sealed class Host
         }
     }
 
-    // ---- consumer polling and state reconciliation ----
+    // ---- consumer polling ----
 
     bool _active;
     int _wantW, _wantH;
@@ -225,162 +244,32 @@ public sealed class Host
         Volatile.Write(ref _reqH, _wantH);
     }
 
-    async Task ReconcileAsync(CancellationToken ct)
+    /// <summary>A failed decoder create is retried, but not more often than once a second.</summary>
+    void RetryDecoderIfNeeded()
     {
-        long now = _time.GetTimestamp();
-        if (_active)
-        {
-            _idleSince = null;
-            if (_link is null && (_lastConnectAttempt is not { } last || _time.GetElapsedTime(last, now) >= ConnectRetry))
-                await TryConnectAsync(now, ct).ConfigureAwait(false);
-
-            // Only talk to the phone after its HELLO (Phone != null); the session's own 5 s timeout ends a silent link.
-            if (_link is { } link && !_ready && link.Phone is not null)
-            {
-                _ready = true;
-                HostLog($"phone ready: {link.Phone.Device}");
-            }
-            if (_link is not null && _ready && (_streamW != _wantW || _streamH != _wantH))
-                await StartStreamingAsync(_wantW, _wantH).ConfigureAwait(false);
-            if (_keyframePending) await SendKeyframeAsync().ConfigureAwait(false);
-        }
-        else
-        {
-            if (_streamW != 0) await StopStreamingAsync().ConfigureAwait(false);
-            if (_link is null) _idleSince = null;
-            else
-            {
-                _idleSince ??= now;
-                if (_time.GetElapsedTime(_idleSince.Value, now) >= IdleClose)
-                {
-                    HostLog("consumer idle for 10 s, closing phone session");
-                    await TeardownLinkAsync().ConfigureAwait(false);
-                }
-            }
-        }
+        long failedAt = Interlocked.Read(ref _createFailedAt);
+        if (failedAt == long.MinValue) return;
+        if (Volatile.Read(ref _createFailedEpoch) != Volatile.Read(ref _epoch)) { Interlocked.Exchange(ref _createFailedAt, long.MinValue); return; }
+        if (_time.GetElapsedTime(failedAt, _time.GetTimestamp()) < DecoderRetry) return;
+        Interlocked.Exchange(ref _createFailedAt, long.MinValue);
+        _links.RetryDecoder();
     }
 
-    async Task TryConnectAsync(long now, CancellationToken ct)
+    // ---- ILinkHost (called on the host loop, except where noted) ----
+
+    void ILinkHost.Log(string line) => HostLog(line);
+    void ILinkHost.LogThrottled(string key, string line) => LogThrottled(key, line);
+    int ILinkHost.DecodeBacklog => Volatile.Read(ref _decodeBacklog);
+    void ILinkHost.SetTelemetry(Telemetry? t) => Volatile.Write(ref _telemetry, t);
+
+    void ILinkHost.EnqueueVideo(IPhoneLink link, VideoFrame frame)
     {
-        _lastConnectAttempt = now;
-        IPhoneLink? link;
-        try { link = await _connector.ConnectAsync(ct).ConfigureAwait(false); }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception e)
-        {
-            LogThrottled("connect", $"connect failed: {e.GetType().Name}: {e.Message}");
-            return;
-        }
-        if (link is null) return; // no phone attached; retry in 1 s
-
-        int no = ++_linkNo;
-        link.Video += f => Post(new VideoEvent(link, f));
-        link.TelemetryReceived += t => Post(new TelemetryEvent(link, t));
-        link.Disconnected += r => Post(new DisconnectedEvent(link, r));
-        _ready = false;
-        _link = link;
-        _linkRun = link.RunAsync(CancellationToken.None);
-        HostLog($"phone link #{no} up");
-    }
-
-    async Task StartStreamingAsync(int w, int h)
-    {
-        var link = _link!;
-        bool restart = _streamW != 0;
-        // Fresh pipeline first so frames of the old size can no longer reach the sink.
-        ResetDecoder(w, h, link);
-        _lastSeq = null;
-        _keyframePending = false;
-        _lastKeyframeSent = null;
-        if (restart)
-        {
-            HostLog($"consumer size changed to {w}x{h}, restarting stream");
-            await SafeAsync(link.StopAsync(), "stop").ConfigureAwait(false);
-        }
-        _streamW = w; _streamH = h;
-        HostLog($"start {w}x{h}");
-        await SafeAsync(link.StartAsync(w, h), "start").ConfigureAwait(false);
-    }
-
-    async Task StopStreamingAsync()
-    {
-        var link = _link;
-        _streamW = _streamH = 0;
-        ResetDecoder(0, 0, null);
-        _keyframePending = false;
-        HostLog("consumer inactive, stop");
-        if (link is not null) await SafeAsync(link.StopAsync(), "stop").ConfigureAwait(false);
-    }
-
-    async Task TeardownLinkAsync()
-    {
-        var link = _link;
-        if (link is null) return;
-        _link = null;
-        _ready = false;
-        _streamW = _streamH = 0;
-        _keyframePending = false;
-        _lastSeq = null;
-        Volatile.Write(ref _telemetry, null);
-        _lastConnectAttempt = _time.GetTimestamp(); // retry no sooner than 1 s from now
-        ResetDecoder(0, 0, null);
-        // Safe here: we are on the host loop, never inside a session event handler.
-        try { await link.DisposeAsync().ConfigureAwait(false); } catch (Exception) { }
-        try { await _linkRun.ConfigureAwait(false); } catch (Exception) { }
-        _linkRun = Task.CompletedTask;
-    }
-
-    async Task ShutdownAsync()
-    {
-        var link = _link;
-        if (link is null) return;
-        if (_streamW != 0)
-        {
-            using var cts = new CancellationTokenSource();
-            var stop = SafeAsync(link.StopAsync(), "stop");
-            var timeout = Task.Delay(StopTimeout, _time, cts.Token);
-            await Task.WhenAny(stop, timeout).ConfigureAwait(false);
-            cts.Cancel();
-        }
-        await TeardownLinkAsync().ConfigureAwait(false);
-    }
-
-    async Task SafeAsync(Task t, string what)
-    {
-        try { await t.ConfigureAwait(false); }
-        catch (Exception e) { LogThrottled("cmd-" + what, $"{what} command failed: {e.GetType().Name}: {e.Message}"); }
-    }
-
-    // ---- video path (host loop side) ----
-
-    async Task OnVideoAsync(VideoFrame f)
-    {
-        if (_streamW == 0) return;
         _fpsIn.Add(_qpcNow());
-        if (_lastSeq is { } last && f.Seq != unchecked(last + 1))
-            await SendKeyframeAsync().ConfigureAwait(false); // gap: the phone dropped frames, refs may be broken
-        _lastSeq = f.Seq;
-        EnqueueDecode(new DecodeItem(Volatile.Read(ref _epoch), 0, 0, _link, f));
-    }
-
-    /// <summary>Keyframe request, at most one per second; a throttled request is remembered and sent on a later tick.</summary>
-    async Task SendKeyframeAsync()
-    {
-        var link = _link;
-        if (link is null || _streamW == 0) { _keyframePending = false; return; }
-        long now = _time.GetTimestamp();
-        if (_lastKeyframeSent is { } t && _time.GetElapsedTime(t, now) < KeyframeMinInterval)
-        {
-            _keyframePending = true;
-            return;
-        }
-        _keyframePending = false;
-        _lastKeyframeSent = now;
-        await SafeAsync(link.RequestKeyframeAsync(), "keyframe").ConfigureAwait(false);
+        EnqueueDecode(new DecodeItem(Volatile.Read(ref _epoch), 0, 0, link, frame));
     }
 
     /// <summary>Tells the decode thread to dispose its decoder and (for w &gt; 0) create a new one. Never blocks.</summary>
-    void ResetDecoder(int w, int h, IPhoneLink? link)
+    void ILinkHost.ResetDecoder(int w, int h, IPhoneLink? link)
     {
         Volatile.Write(ref _wantSize, w > 0 ? Pack(w, h) : 0);
         int epoch = Interlocked.Increment(ref _epoch);
@@ -414,7 +303,8 @@ public sealed class Host
                     if (item.Frame is null)
                     {
                         dec?.Dispose();
-                        dec = null; dw = dh = 0; needKey = false;
+                        dec = null; dw = dh = 0;
+                        needKey = item.Width > 0; // a fresh decoder must start on a keyframe, never on old P-frames
                         decEpoch = item.Epoch;
                         if (item.Width > 0)
                         {
@@ -428,6 +318,8 @@ public sealed class Host
                             catch (Exception e)
                             {
                                 dec = null;
+                                Volatile.Write(ref _createFailedEpoch, item.Epoch);
+                                Interlocked.Exchange(ref _createFailedAt, _time.GetTimestamp());
                                 LogThrottled("decoder-create", $"decoder create failed: {e.GetType().Name}: {e.Message}");
                             }
                         }
@@ -502,10 +394,9 @@ public sealed class Host
 
     abstract record HostEvent;
     sealed record TickEvent : HostEvent;
-    sealed record VideoEvent(IPhoneLink Link, VideoFrame Frame) : HostEvent;
-    sealed record TelemetryEvent(IPhoneLink Link, Telemetry Telemetry) : HostEvent;
-    sealed record DisconnectedEvent(IPhoneLink Link, string Reason) : HostEvent;
     sealed record KeyframeWantedEvent : HostEvent;
+    /// <summary>Work to run on the host loop. <paramref name="Dropped"/> runs instead if the loop ends first.</summary>
+    sealed record CallEvent(Func<Task> Work, Action? Dropped) : HostEvent;
     sealed record BarrierEvent : HostEvent
     {
         public TaskCompletionSource Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

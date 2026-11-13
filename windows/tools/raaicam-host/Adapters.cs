@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using RaaiCam.Core.Discovery;
 using RaaiCam.Core.Hosting;
 using RaaiCam.Core.Pairing;
 using RaaiCam.Core.Phone;
@@ -67,11 +70,21 @@ sealed class PhoneLink(PhoneSession session) : IPhoneLink
     public double? RttMs => session.Clock.RttMs;
     public long? ToPcUs(ulong phoneUs) => session.Clock.ToPcUs(phoneUs);
     public Task RunAsync(CancellationToken ct) => session.RunAsync(ct);
-    public Task StartAsync(int width, int height) => session.StartAsync(width, height);
+    public Task StartAsync(int width, int height, int kbps) => session.StartAsync(width, height, "wide", kbps);
     public Task StopAsync() => session.StopAsync();
     public Task RequestKeyframeAsync() => session.RequestKeyframeAsync();
     public Task SendRouteAsync(bool video) => session.SendRouteAsync(video);
+    public Task SetBitrateAsync(int kbps) => session.SetBitrateAsync(kbps);
+    public Task UnpairAsync() => session.UnpairAsync();
     public ValueTask DisposeAsync() => session.DisposeAsync();
+}
+
+static class PhoneLinks
+{
+    /// <summary>The authenticated v2 handshake in paired mode over an already open transport. PhoneSession timebase = microseconds of Stopwatch time (the host's qpc).</summary>
+    public static PhoneLink Create(Stream transport, ILogSink log, PairingStore store, PairedPhone paired) =>
+        new(new PhoneSession(transport, () => (ulong)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency)), log,
+            new SecureLinkOptions(store.GetOrCreateIdentity(), store, paired, null)));
 }
 
 /// <summary>
@@ -94,9 +107,64 @@ sealed class UsbPhoneConnector(UsbmuxClient usbmux, ILogSink log, PairingStore s
         var devices = await usbmux.ListDevicesAsync(ct);
         if (devices.Count == 0) return null;
         var stream = await usbmux.ConnectAsync(devices[0].DeviceId, PhonePort, ct);
-        // PhoneSession timebase must match the host's qpc: microseconds of Stopwatch time.
-        var session = new PhoneSession(stream, () => (ulong)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency)), log,
-            new SecureLinkOptions(store.GetOrCreateIdentity(), store, paired, null));
-        return new PhoneLink(session);
+        return PhoneLinks.Create(stream, log, store, paired);
+    }
+}
+
+/// <summary>
+/// Wi-Fi: Bonjour/last-known-address discovery for the paired phone (matched by the id hash of its static key), then a TCP
+/// connect and the same paired-mode handshake as USB. Unpaired: nothing is offered (and nothing is browsed).
+/// </summary>
+sealed class WifiPhoneConnector(ILogSink log, PairingStore store, SettingsStore settings) : IWifiConnector, IAsyncDisposable
+{
+    readonly object _gate = new();
+    UdpMdnsTransport? _transport;
+
+    UdpMdnsTransport Transport
+    {
+        get { lock (_gate) return _transport ??= new UdpMdnsTransport(log); }
+    }
+
+    public async IAsyncEnumerable<WifiCandidate> BrowseAsync([EnumeratorCancellation] CancellationToken ct)
+    {
+        PairedPhone? paired;
+        while ((paired = store.Phone) is null) await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+
+        // One WifiDiscovery per browse (it allows a single consumer); the transport is shared and disposed with the connector.
+        var discovery = new WifiDiscovery(Transport, settings, WifiDiscovery.IdHashFor(paired.PublicKey), log: log);
+        await foreach (var p in discovery.BrowseAsync(ct).ConfigureAwait(false))
+            yield return new WifiCandidate(p.Address, p.Port);
+    }
+
+    public async Task<IPhoneLink> ConnectAsync(WifiCandidate candidate, CancellationToken ct)
+    {
+        if (store.Phone is not { } paired) throw new IOException("no phone is paired");
+        var client = new TcpClient(candidate.Address.AddressFamily) { NoDelay = true };
+        try
+        {
+            await client.ConnectAsync(candidate.Address, candidate.Port, ct).ConfigureAwait(false);
+            return PhoneLinks.Create(client.GetStream(), log, store, paired); // the stream owns the socket from here
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
+    }
+
+    public void RecordWorkingAddress(System.Net.IPAddress address)
+    {
+        try { settings.SetLastPhoneIp(address); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            log.Write("pc", "could not save last phone ip: " + e.GetType().Name);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        UdpMdnsTransport? t;
+        lock (_gate) { t = _transport; _transport = null; }
+        if (t is not null) await t.DisposeAsync().ConfigureAwait(false);
     }
 }

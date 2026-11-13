@@ -3,242 +3,6 @@ using RaaiCam.Protocol;
 
 namespace RaaiCam.Core.Tests;
 
-// ---- fakes (deterministic: FakeTimeProvider drives every host timer, waits are signal based) ----
-
-/// <summary>Pulsed by every fake whenever something observable changes; tests wait on conditions, never sleep.</summary>
-sealed class Observed
-{
-    readonly SemaphoreSlim _s = new(0);
-    public void Pulse() => _s.Release();
-
-    public async Task Until(Func<bool> cond)
-    {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        while (!cond()) await _s.WaitAsync(cts.Token);
-    }
-}
-
-sealed class FakeConsumer : IConsumerSource
-{
-    readonly object _gate = new();
-    ConsumerRequest? _state;
-    public ConsumerRequest? Read() { lock (_gate) return _state; }
-    public void Set(bool active, int w, int h) { lock (_gate) _state = new ConsumerRequest(active, w, h); }
-    public void Inactive() => Set(false, 0, 0);
-}
-
-sealed class FakeLink(Observed obs) : IPhoneLink
-{
-    readonly object _gate = new();
-    readonly List<string> _commands = new();
-    readonly TaskCompletionSource _run = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    public event Action<VideoFrame>? Video;
-    public event Action<Telemetry>? TelemetryReceived;
-    public event Action<string>? Disconnected;
-
-    public HelloInfo? Phone { get; set; } = new(2, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
-    public byte[]? PhoneStaticKey { get; set; } = new byte[32];
-    public double? RttMs { get; set; } = 3.0;
-    public long? OffsetUs { get; set; } = 0;
-    public volatile bool Disposed;
-    public TaskCompletionSource? StartGate;
-
-    public long? ToPcUs(ulong phoneUs) => OffsetUs is { } o ? (long)phoneUs - o : null;
-
-    public List<string> Commands { get { lock (_gate) return _commands.ToList(); } }
-    public int Count(string cmd) { lock (_gate) return _commands.Count(c => c == cmd); }
-    void Add(string c) { lock (_gate) _commands.Add(c); obs.Pulse(); }
-
-    public Task RunAsync(CancellationToken ct) => _run.Task;
-
-    public async Task StartAsync(int width, int height)
-    {
-        Add($"start {width}x{height}");
-        if (StartGate is { } g) await g.Task;
-    }
-
-    public Task StopAsync() { Add("stop"); return Task.CompletedTask; }
-    public Task RequestKeyframeAsync() { Add("keyframe"); return Task.CompletedTask; }
-    public Task SendRouteAsync(bool video) { Add(video ? "route video" : "route idle"); return Task.CompletedTask; }
-
-    public ValueTask DisposeAsync()
-    {
-        Disposed = true;
-        _run.TrySetResult();
-        obs.Pulse();
-        return ValueTask.CompletedTask;
-    }
-
-    public void RaiseVideo(uint seq, bool key, ulong captureUs = 0) =>
-        Video?.Invoke(new VideoFrame(captureUs, seq, key, new[] { (byte)seq }));
-    public void RaiseTelemetry(Telemetry t) => TelemetryReceived?.Invoke(t);
-    public void RaiseDisconnected(string reason) => Disconnected?.Invoke(reason);
-}
-
-sealed class FakeConnector(Observed obs) : IPhoneConnector
-{
-    readonly object _gate = new();
-    readonly Queue<Func<IPhoneLink?>> _script = new();
-    public readonly List<FakeLink> Links = new();
-    int _attempts;
-
-    public int Attempts => Volatile.Read(ref _attempts);
-
-    /// <summary>Queue the outcome of the next attempt. Unscripted attempts create a fresh link.</summary>
-    public void Script(Func<IPhoneLink?> next) { lock (_gate) _script.Enqueue(next); }
-
-    public Task<IPhoneLink?> ConnectAsync(CancellationToken ct)
-    {
-        Interlocked.Increment(ref _attempts);
-        Func<IPhoneLink?>? next;
-        lock (_gate) next = _script.Count > 0 ? _script.Dequeue() : null;
-        IPhoneLink? link;
-        if (next is not null) link = next();
-        else link = NewLink();
-        obs.Pulse();
-        return Task.FromResult(link);
-    }
-
-    public FakeLink NewLink()
-    {
-        var l = new FakeLink(obs);
-        lock (_gate) Links.Add(l);
-        return l;
-    }
-}
-
-sealed class FakeDecoder : IVideoDecoder
-{
-    readonly FakeDecoderFactory _f;
-    public readonly int W, H;
-    public readonly int CreatedOnThread = Environment.CurrentManagedThreadId;
-    public readonly List<int> UsedOnThreads = new();
-    public int DisposedOnThread = -1;
-
-    public FakeDecoder(FakeDecoderFactory f, int w, int h) { _f = f; W = w; H = h; }
-
-    public event Action? KeyframeNeeded;
-    public void RaiseKeyframeNeeded() => KeyframeNeeded?.Invoke();
-
-    public VideoDecodeResult Decode(ReadOnlySpan<byte> accessUnit, long sampleTime100ns, Span<byte> nv12Out, out int stride)
-    {
-        stride = W;
-        UsedOnThreads.Add(Environment.CurrentManagedThreadId);
-        return _f.OnDecode(this, accessUnit[0]);
-    }
-
-    public void Dispose()
-    {
-        DisposedOnThread = Environment.CurrentManagedThreadId;
-        _f.Obs.Pulse();
-    }
-}
-
-sealed class FakeDecoderFactory(Observed obs) : IDecoderFactory
-{
-    readonly object _gate = new();
-    readonly List<FakeDecoder> _created = new();
-    readonly List<int> _decodedSeqs = new();
-    public Observed Obs => obs;
-
-    public Func<FakeDecoder, byte, VideoDecodeResult>? Behavior;
-
-    public List<FakeDecoder> Created { get { lock (_gate) return _created.ToList(); } }
-    public List<int> DecodedSeqs { get { lock (_gate) return _decodedSeqs.ToList(); } }
-
-    public IVideoDecoder Create(int width, int height)
-    {
-        var d = new FakeDecoder(this, width, height);
-        lock (_gate) _created.Add(d);
-        obs.Pulse();
-        return d;
-    }
-
-    internal VideoDecodeResult OnDecode(FakeDecoder d, byte seq)
-    {
-        lock (_gate) _decodedSeqs.Add(seq);
-        obs.Pulse();
-        return Behavior?.Invoke(d, seq) ?? VideoDecodeResult.Frame;
-    }
-}
-
-sealed class FakeSink(Observed obs) : IFrameSink
-{
-    readonly object _gate = new();
-    readonly List<(int W, int H, int Stride, long Qpc)> _writes = new();
-    public List<(int W, int H, int Stride, long Qpc)> Writes { get { lock (_gate) return _writes.ToList(); } }
-
-    public bool WriteFrame(ReadOnlySpan<byte> nv12, int width, int height, int stride, long timestampQpc)
-    {
-        lock (_gate) _writes.Add((width, height, stride, timestampQpc));
-        obs.Pulse();
-        return true;
-    }
-}
-
-sealed class HostRig : IAsyncDisposable
-{
-    public readonly Observed Obs = new();
-    public readonly FakeTimeProvider Time = new();
-    public readonly FakeConsumer Consumer = new();
-    public readonly FakeConnector Connector;
-    public readonly FakeDecoderFactory Decoders;
-    public readonly FakeSink Sink;
-    public readonly ListLogSink Log = new();
-    public readonly Host Host;
-    public long Qpc = 1_000;
-    readonly SemaphoreSlim _ticks = new(0);
-    readonly CancellationTokenSource _cts = new();
-    public Task Run = Task.CompletedTask;
-
-    public HostRig()
-    {
-        Connector = new FakeConnector(Obs);
-        Decoders = new FakeDecoderFactory(Obs);
-        Sink = new FakeSink(Obs);
-        Host = new Host(Consumer, Connector, Decoders, Sink, () => Interlocked.Read(ref Qpc), Log, Time, 1_000_000);
-        Host.OnTickProcessed = () => _ticks.Release();
-    }
-
-    public FakeLink Link => Connector.Links[0];
-
-    /// <summary>Starts the host and (by default) waits for its first, immediate tick to be fully processed.</summary>
-    public async Task StartAsync(bool waitFirstTick = true)
-    {
-        Run = Host.RunAsync(_cts.Token);
-        if (waitFirstTick) await WaitTick();
-    }
-
-    async Task WaitTick()
-    {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        await _ticks.WaitAsync(cts.Token);
-    }
-
-    /// <summary>Advances fake time by 100 ms per step; each step is one full host poll tick.</summary>
-    public async Task StepAsync(int n = 1)
-    {
-        for (int i = 0; i < n; i++)
-        {
-            await Time.WaitForTimerAsync(TimeSpan.FromMilliseconds(100));
-            Time.Advance(TimeSpan.FromMilliseconds(100));
-            await WaitTick();
-        }
-    }
-
-    /// <summary>Waits until every event raised so far has been handled by the host loop.</summary>
-    public Task FlushAsync() => Host.FlushAsync().WaitAsync(TimeSpan.FromSeconds(10));
-
-    public void Cancel() => _cts.Cancel();
-
-    public async ValueTask DisposeAsync()
-    {
-        _cts.Cancel();
-        try { await Run.WaitAsync(TimeSpan.FromSeconds(10)); } catch (OperationCanceledException) { }
-    }
-}
-
 public class HostTests
 {
     [Fact]
@@ -249,7 +13,7 @@ public class HostTests
         await rig.StartAsync();
 
         Assert.Equal(1, rig.Connector.Attempts);
-        Assert.Equal(new[] { "start 1280x720" }, rig.Link.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720" }, rig.Link.Commands);
         await rig.Obs.Until(() => rig.Decoders.Created.Count == 1);
         Assert.Equal((1280, 720), (rig.Decoders.Created[0].W, rig.Decoders.Created[0].H));
 
@@ -314,7 +78,7 @@ public class HostTests
         rig.Consumer.Set(true, 1280, 720);
         await rig.StepAsync(1);
         Assert.Equal(1, rig.Connector.Attempts);
-        Assert.Equal(new[] { "start 1280x720", "stop", "start 1280x720" }, rig.Link.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720", "stop", "start 1280x720" }, rig.Link.Commands);
     }
 
     [Fact]
@@ -338,7 +102,7 @@ public class HostTests
 
         rig.Consumer.Set(true, 1920, 1080);
         await rig.StepAsync(1);
-        Assert.Equal(new[] { "start 1280x720", "stop", "start 1920x1080" }, rig.Link.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720", "stop", "start 1920x1080" }, rig.Link.Commands);
 
         gate.Set(); // the stale 1280x720 frame now finishes decoding and must be dropped
         await rig.Obs.Until(() => rig.Decoders.Created.Count == 2);
@@ -379,13 +143,14 @@ public class HostTests
         Assert.True(first.Disposed);
         Assert.Equal(2, rig.Connector.Attempts);
         var second = rig.Connector.Links[1];
-        Assert.Equal(new[] { "start 1280x720" }, second.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720" }, second.Commands);
         Assert.Equal("usb", rig.Host.Status.Link);
     }
 
     [Fact]
-    public async Task Host_RetriesConnectEveryOneSecondWhileActive()
+    public async Task Host_RetriesConnectWithBackoffWhileActive()
     {
+        // FR-CON-6: 0.5 s, 1 s, ... after each failed attempt (replaces the old fixed 1 s retry).
         await using var rig = new HostRig();
         rig.Consumer.Set(true, 1280, 720);
         rig.Connector.Script(() => null);                                   // no phone attached
@@ -393,13 +158,15 @@ public class HostTests
         await rig.StartAsync();
         Assert.Equal(1, rig.Connector.Attempts);
 
-        await rig.StepAsync(9);
+        await rig.StepAsync(4);
         Assert.Equal(1, rig.Connector.Attempts);
-        await rig.StepAsync(1);
+        await rig.StepAsync(1);   // 0.5 s
         Assert.Equal(2, rig.Connector.Attempts);
-        await rig.StepAsync(10);
+        await rig.StepAsync(9);   // 1.4 s
+        Assert.Equal(2, rig.Connector.Attempts);
+        await rig.StepAsync(1);   // 1.5 s
         Assert.Equal(3, rig.Connector.Attempts);
-        Assert.Equal(new[] { "start 1280x720" }, rig.Link.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720" }, rig.Link.Commands);
     }
 
     [Fact]
@@ -483,7 +250,7 @@ public class HostTests
 
         link.Phone = new HelloInfo(2, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
         await rig.StepAsync(1);
-        Assert.Equal(new[] { "start 1280x720" }, link.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720" }, link.Commands);
     }
 
     [Fact]
@@ -588,7 +355,7 @@ public class HostTests
         rig.Cancel();
         await rig.Run.WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.Equal(new[] { "start 1280x720", "stop" }, link.Commands);
+        Assert.Equal(new[] { "route video", "start 1280x720", "stop" }, link.Commands);
         Assert.True(link.Disposed);
     }
 }

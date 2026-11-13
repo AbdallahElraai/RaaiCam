@@ -19,6 +19,8 @@ sealed class ListLogSink : ILogSink
         _signal.Release();
     }
 
+    public List<string> Lines => Snapshot().Select(x => x.Line).ToList();
+
     public List<(string Source, string Line)> Snapshot()
     {
         lock (_gate) return _lines.ToList();
