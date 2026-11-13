@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
 using RaaiCam.Core.Discovery;
 using RaaiCam.Core.Hosting;
 using RaaiCam.Core.Pairing;
@@ -8,7 +7,8 @@ using RaaiCam.Core.Usbmux;
 using RaaiCam.HostApp;
 using RaaiCam.Media;
 
-// raaicam-host: phone (USB) -> H.264 decoder -> RaaiCam virtual camera.
+// raaicam-host: phone (USB or Wi-Fi) -> H.264 decoder -> RaaiCam virtual camera.
+// raaicam-host [--pair | --unpair | --list-devices]; exit codes: 0 ok, 1 pairing failed, 2 no device, 3 not paired, 4 pairing file error.
 if (args.Contains("--list-devices"))
 {
     // Preflight for run-phone-checks.ps1: "devices=N", "app=reachable|unreachable|n/a". Exit 0 when a device is attached.
@@ -39,6 +39,23 @@ if (args.Contains("--list-devices"))
     return 0;
 }
 
+if (args.Contains("--check-paired"))
+{
+    // Preflight for run-phone-checks.ps1: "paired=yes|no". Exit 0 paired, 3 not paired, 4 pairing file unreadable. Touches no phone.
+    try
+    {
+        var checkStore = new PairingStore(PairingStore.DefaultPath, new DpapiDataProtector(), new FileLogSink());
+        bool paired = checkStore.Phone is not null;
+        Console.WriteLine(paired ? "paired=yes" : "paired=no");
+        return paired ? ExitCodes.Ok : ExitCodes.NotPaired;
+    }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        Console.WriteLine("paired=error");
+        return ExitCodes.StoreError;
+    }
+}
+
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
@@ -48,9 +65,27 @@ Console.CancelKeyPress += (_, e) =>
 var ct = cts.Token;
 
 var log = new FileLogSink();
+var store = new PairingStore(PairingStore.DefaultPath, new DpapiDataProtector(), log);
+if (args.Contains("--pair")) return await HostCli.PairAsync(store, log, ct);
+if (args.Contains("--unpair")) return await HostCli.UnpairAsync(store, log, ct);
+
+// Normal run needs a paired phone; say how to pair instead of polling forever.
+try
+{
+    if (store.Phone is null)
+    {
+        Console.WriteLine("raaicam-host: no phone is paired with this PC. Run: raaicam-host --pair");
+        return ExitCodes.NotPaired;
+    }
+}
+catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+{
+    Console.Error.WriteLine("raaicam-host: cannot read the pairing file (" + e.GetType().Name + "). Close other programs using it and try again.");
+    return ExitCodes.StoreError;
+}
+
 using var sink = new VirtualCameraSink();
 var adapter = new SinkAdapter(sink);
-var store = new PairingStore(PairingStore.DefaultPath, new DpapiDataProtector(), log);
 await using var wifi = new WifiPhoneConnector(log, store, new SettingsStore(SettingsStore.DefaultPath));
 var host = new Host(adapter, new UsbPhoneConnector(new UsbmuxClient(), log, store), new H264DecoderFactory(), adapter,
     Stopwatch.GetTimestamp, log, wifi: wifi, pairedKey: () => store.Phone?.PublicKey);
@@ -62,22 +97,9 @@ while (!run.IsCompleted)
     try { await Task.WhenAny(run, Task.Delay(1000, ct)); }
     catch (OperationCanceledException) { }
     if (run.IsCompleted) break;
-    Console.WriteLine(FormatStatus(host.Status));
+    Console.WriteLine(StatusLine.Format(host.Status));
 }
 try { await run; }
 catch (OperationCanceledException) { }
 Console.WriteLine("raaicam-host: stopped.");
 return 0;
-
-static string FormatStatus(HostStatus s)
-{
-    var ic = CultureInfo.InvariantCulture;
-    string consumer = s.ConsumerWidth > 0 ? $"{s.ConsumerWidth}x{s.ConsumerHeight}" : "inactive";
-    string lat = s.LatencyP50Ms is { } p50 && s.LatencyP95Ms is { } p95
-        ? string.Create(ic, $"{p50:F0}/{p95:F0}ms") : "-/-ms";
-    string rtt = s.RttMs is { } r ? string.Create(ic, $"{r:F0}ms") : "-";
-    string rate = s.BitrateMbps is { } b ? string.Create(ic, $"{b:F1}Mbps") : "-";
-    string batt = s.BatteryPercent is { } p ? $"{p}%{(s.Charging == true ? "+" : "")}" : "-";
-    return string.Create(ic,
-        $"link={s.Link} standby={s.Standby} kbps={s.TargetBitrateKbps} phone={s.Phone ?? "-"} consumer={consumer} in={s.FpsIn:F1} out={s.FpsOut:F1} lat={lat} rtt={rtt} {rate} thermal={s.Thermal ?? "-"} batt={batt}");
-}
