@@ -25,5 +25,7 @@ if ($Test) {
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
   dotnet test (Join-Path $here 'RaaiCam.Media.Tests') -c Release --no-build
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
+  dotnet test (Join-Path $here 'RaaiCam.Protocol.Tests') -c Release --no-build
+  if ($LASTEXITCODE) { exit $LASTEXITCODE }
 }
 exit 0
