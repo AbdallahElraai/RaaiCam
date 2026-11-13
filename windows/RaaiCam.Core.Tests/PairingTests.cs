@@ -10,8 +10,12 @@ sealed class FakeProtector : IDataProtector
 {
     static readonly byte[] Magic = "FAKE"u8.ToArray();
 
+    public volatile bool FailProtectWithIo;
+    public volatile bool FailUnprotectWithIo;
+
     public byte[] Protect(byte[] plain)
     {
+        if (FailProtectWithIo) throw new IOException("disk full");
         var o = new byte[Magic.Length + plain.Length];
         Magic.CopyTo(o, 0);
         for (int i = 0; i < plain.Length; i++) o[Magic.Length + i] = (byte)(plain[i] ^ 0x5A);
@@ -20,6 +24,7 @@ sealed class FakeProtector : IDataProtector
 
     public byte[] Unprotect(byte[] protectedData)
     {
+        if (FailUnprotectWithIo) throw new IOException("transient");
         if (protectedData.Length < Magic.Length || !protectedData.AsSpan(0, Magic.Length).SequenceEqual(Magic))
             throw new CryptographicException("not protected by FakeProtector");
         var o = new byte[protectedData.Length - Magic.Length];
@@ -227,13 +232,81 @@ public class PairingTests
     }
 
     [Fact]
-    public void Qr_ConsoleStringIsSquareAndNonEmpty()
+    public void Store_ReadIoErrorNeverOverwritesExistingFile()
+    {
+        using var dir = new TempDir();
+        var path = dir.File("pairing.bin");
+        var prot = new FakeProtector();
+        var id = new PairingStore(path, prot).GetOrCreateIdentity();
+        var before = File.ReadAllBytes(path);
+
+        var s = new PairingStore(path, prot);
+        prot.FailUnprotectWithIo = true;
+        Assert.Throws<IOException>(() => s.GetOrCreateIdentity());
+        Assert.Throws<IOException>(() => s.SavePhone(PhonePub, "x"));
+        Assert.Equal(before, File.ReadAllBytes(path)); // untouched, nothing quarantined
+        Assert.Empty(Directory.GetFiles(dir.Path, "pairing.bin.bad-*"));
+
+        prot.FailUnprotectWithIo = false; // the same instance recovers and sees the original identity
+        Assert.Equal(id.PcId, s.GetOrCreateIdentity().PcId);
+    }
+
+    [Fact]
+    public void Store_FailedSaveLeavesStateUnchanged()
+    {
+        using var dir = new TempDir();
+        var path = dir.File("pairing.bin");
+        var prot = new FakeProtector();
+        var s = new PairingStore(path, prot);
+        var id = s.GetOrCreateIdentity();
+        s.SavePhone(PhonePub, "first");
+
+        prot.FailProtectWithIo = true;
+        Assert.Throws<IOException>(() => s.SavePhone(new byte[32], "second"));
+        Assert.Equal("first", s.Phone!.Label);
+        Assert.Throws<IOException>(() => s.Unpair());
+        Assert.Equal("first", s.Phone!.Label);
+        Assert.Equal(id.PcId, s.GetOrCreateIdentity().PcId);
+
+        prot.FailProtectWithIo = false;
+        Assert.Equal("first", new PairingStore(path, prot).Phone!.Label); // file unchanged too
+    }
+
+    [Fact]
+    public void Store_FailedFirstSaveDoesNotExposeIdentity()
+    {
+        using var dir = new TempDir();
+        var prot = new FakeProtector { FailProtectWithIo = true };
+        var s = new PairingStore(dir.File("pairing.bin"), prot);
+        Assert.Throws<IOException>(() => s.GetOrCreateIdentity());
+        Assert.False(File.Exists(dir.File("pairing.bin")));
+        prot.FailProtectWithIo = false;
+        var id = s.GetOrCreateIdentity(); // and persists the identity it hands out
+        Assert.Equal(id.PcId, new PairingStore(dir.File("pairing.bin"), prot).GetOrCreateIdentity().PcId);
+    }
+    [Fact]
+    public void Qr_ConsoleStringIsSquareBlackOnWhiteWithQuietZone()
     {
         var text = PairingQr.ToConsoleString("raaicam://pair?v=2&x=1");
-        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.TrimEnd('\r')).ToArray();
-        Assert.True(lines.Length >= 21);
-        Assert.All(lines, l => Assert.Equal(lines[0].Length, l.Length));
-        // two characters per module: the character width is twice the module count (rows == modules)
-        Assert.Equal(lines.Length * 2, lines[0].Length);
+        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.True(lines.Length >= 29); // 21 modules + 2 x 4 quiet zone
+        Assert.All(lines, l => Assert.EndsWith("\u001b[0m", l));
+        Assert.Contains("\u001b[40m", text);
+        Assert.Contains("\u001b[107m", text);
+        // each colour switch applies to the following two-space modules
+        var rx = new Regex("\u001b\\[(40|107)m((?:  )+)");
+        var grid = lines.Select(l => rx.Matches(l)
+            .SelectMany(m => Enumerable.Repeat(m.Groups[1].Value == "40", m.Groups[2].Length / 2)).ToArray()).ToArray();
+        Assert.All(grid, g => Assert.Equal(grid.Length, g.Length)); // two characters per module => square
+        int n = grid.Length;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < n; j++)
+            {
+                Assert.False(grid[i][j]);
+                Assert.False(grid[n - 1 - i][j]);
+                Assert.False(grid[j][i]);
+                Assert.False(grid[j][n - 1 - i]);
+            }
+        Assert.True(grid[4][4]); // finder pattern corner is dark
     }
 }

@@ -92,8 +92,9 @@ public sealed class PairingStore
             if (_state is null)
             {
                 var (priv, pub) = X25519.Generate();
-                _state = new State(RandomNumberGenerator.GetBytes(16), priv, pub, null);
-                Save();
+                var fresh = new State(RandomNumberGenerator.GetBytes(16), priv, pub, null);
+                Save(fresh); // persist first; only then expose it
+                _state = fresh;
                 Log("created a new PC identity");
             }
             return new PcIdentity((byte[])_state.PcId.Clone(), (byte[])_state.Private.Clone(), (byte[])_state.Public.Clone());
@@ -108,8 +109,9 @@ public sealed class PairingStore
         lock (_gate)
         {
             var phone = new PairedPhone((byte[])phoneStaticPub.Clone(), label ?? "", _time.GetUtcNow());
-            _state = _state! with { Phone = phone };
-            Save();
+            var next = _state! with { Phone = phone };
+            Save(next);
+            _state = next;
             Log("phone paired");
             return phone;
         }
@@ -122,8 +124,9 @@ public sealed class PairingStore
         {
             Load();
             if (_state is null) return;
-            _state = _state with { Phone = null };
-            Save();
+            var next = _state with { Phone = null };
+            Save(next);
+            _state = next;
             Log("phone unpaired");
         }
     }
@@ -151,11 +154,13 @@ public sealed class PairingStore
     void Load()
     {
         if (_loaded) return;
-        _loaded = true;
-        if (!File.Exists(_path)) return;
+        if (!File.Exists(_path)) { _loaded = true; return; }
+        // An IO error (locked file, transient failure) propagates with _loaded still false: we must never create a new
+        // identity over a file we merely failed to read.
+        var raw = File.ReadAllBytes(_path);
         try
         {
-            var plain = _protector.Unprotect(File.ReadAllBytes(_path));
+            var plain = _protector.Unprotect(raw);
             try { _state = Parse(plain); }
             finally { CryptographicOperations.ZeroMemory(plain); }
         }
@@ -164,6 +169,7 @@ public sealed class PairingStore
         {
             Quarantine(e.GetType().Name);
         }
+        _loaded = true;
     }
 
     static State Parse(byte[] json)
@@ -198,12 +204,12 @@ public sealed class PairingStore
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             Log($"pairing file unreadable ({why}) and could not be quarantined: {e.GetType().Name}");
+            throw; // never overwrite a file we could not move aside
         }
     }
 
-    void Save()
+    void Save(State s)
     {
-        var s = _state!;
         var dto = new FileDto
         {
             V = Version,
@@ -227,7 +233,11 @@ public sealed class PairingStore
         var tmp = Path.Combine(dir, Path.GetFileName(_path) + "." + Guid.NewGuid().ToString("N")[..8] + ".tmp");
         try
         {
-            File.WriteAllBytes(tmp, blob);
+            using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(blob);
+                fs.Flush(true); // reach the disk before the replace
+            }
             if (File.Exists(_path)) File.Replace(tmp, _path, null);
             else File.Move(tmp, _path);
         }

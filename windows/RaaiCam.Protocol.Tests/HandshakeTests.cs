@@ -103,6 +103,18 @@ public class HandshakeTests
     // ---- auth ----
 
     [Fact]
+    public void Initiator_AbortInvalidatesHandshake()
+    {
+        using var pc = StaticKey.Generate();
+        var i = new InitiatorHandshake(pc, new byte[16], StaticKey.Generate().Public, null);
+        i.CreateAuth1();
+        i.Abort();
+        Assert.Throws<CryptoProtocolException>(() => i.ReadAuth2(new byte[80]));
+        Assert.Throws<CryptoProtocolException>(() => i.CreateAuth3());
+        Assert.Throws<CryptoProtocolException>(() => _ = i.Keys);
+    }
+
+    [Fact]
     public void Auth_PairedModeSucceeds()
     {
         var g = new Rig();

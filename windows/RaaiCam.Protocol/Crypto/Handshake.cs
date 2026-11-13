@@ -121,6 +121,9 @@ public sealed class InitiatorHandshake
         catch { Fail(); throw; }
     }
 
+    /// <summary>Abandons the handshake (timeout, cancel, transport failure): zeroes the ephemeral key and DH outputs. Idempotent.</summary>
+    public void Abort() => Fail();
+
     void WipeSecrets()
     {
         HandshakeLayout.Wipe(_eI.Private, _dhEE, _dhSE, _dhES, _dhSS, _th2);

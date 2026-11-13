@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 using RaaiCam.Core.Pairing;
 using RaaiCam.Protocol;
@@ -29,6 +30,11 @@ public sealed class PhoneSession : IAsyncDisposable
     static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(5);
     static readonly TimeSpan ConfirmTimeout = TimeSpan.FromSeconds(5);
     static readonly TimeSpan PingInterval = TimeSpan.FromSeconds(1);
+
+    // Per-phase inbound frame caps (checked before the payload is allocated).
+    const int HelloMaxPayload = 1024;
+    const int Auth2MaxPayload = 80;      // exactly the AUTH2 length
+    const int ConfirmMaxPayload = 4096;  // the INFO frame, sealed
 
     readonly Stream _transport;
     readonly Func<ulong> _pcNowUs;
@@ -89,7 +95,7 @@ public sealed class PhoneSession : IAsyncDisposable
             using (var helloCts = new CancellationTokenSource(HelloTimeout, _time))
             using (var both = CancellationTokenSource.CreateLinkedTokenSource(token, helloCts.Token))
             {
-                try { first = await FrameCodec.ReadAsync(_transport, both.Token).ConfigureAwait(false); }
+                try { first = await FrameCodec.ReadAsync(_transport, both.Token, HelloMaxPayload).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (helloCts.IsCancellationRequested && !token.IsCancellationRequested)
                 {
                     reason = "no hello";
@@ -125,7 +131,7 @@ public sealed class PhoneSession : IAsyncDisposable
             {
                 PcLog("authenticated; awaiting INFO");
                 Frame? f1;
-                try { f1 = await FrameCodec.ReadAsync(_transport, confBoth.Token).ConfigureAwait(false); }
+                try { f1 = await FrameCodec.ReadAsync(_transport, confBoth.Token, ConfirmMaxPayload).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (confCts.IsCancellationRequested && !token.IsCancellationRequested)
                 {
                     reason = "not confirmed";
@@ -140,21 +146,25 @@ public sealed class PhoneSession : IAsyncDisposable
                 info = Messages.ParseInfo(inner.Payload.Span);
             }
 
-            // Confirmed: the phone proved it holds the session keys.
-            _phoneKey = phoneKey;
-            _phone = info;
-            _confirmed = true;
-            PcLog($"phone confirmed: {info.Device}");
+            // Confirmed: the phone proved it holds the session keys. Persist (mode 2) BEFORE exposing the phone, so a failure
+            // leaves Phone null and no half-paired state.
+            PairedPhone? saved = null;
             if (_secure.Pairing is { } p)
             {
                 if (!p.TryMarkUsed()) throw new ProtocolException("pairing token already used");
-                PairedPhone saved;
                 try { saved = _secure.Store.SavePhone(phoneKey, string.IsNullOrWhiteSpace(info.Device) ? "iPhone" : info.Device); }
                 catch (Exception e)
                 {
                     reason = "could not save pairing: " + e.GetType().Name;
                     return;
                 }
+            }
+            _phoneKey = phoneKey;
+            _confirmed = true; // before Phone: a host that reacts to Phone must find commands enabled
+            _phone = info;
+            PcLog($"phone confirmed: {info.Device}");
+            if (saved is not null)
+            {
                 PcLog("paired");
                 Raise(Paired, saved);
             }
@@ -185,13 +195,13 @@ public sealed class PhoneSession : IAsyncDisposable
         finally
         {
             link.Cancel();
+            Disconnect(reason); // cancels _cts and raises Disconnected now, before any waiting below
             if (pingLoop is not null)
             {
                 try { await pingLoop.ConfigureAwait(false); } catch (Exception) { }
             }
             await TeardownCryptoAsync().ConfigureAwait(false);
             _runDone.TrySetResult();
-            Disconnect(reason);
         }
     }
 
@@ -200,18 +210,30 @@ public sealed class PhoneSession : IAsyncDisposable
     {
         var pairing = _secure.Pairing;
         using var pcKey = _secure.Identity.ToStaticKey();
-        var hs = new InitiatorHandshake(pcKey, _secure.Identity.PcId, pairing is null ? _secure.Phone!.PublicKey : null, pairing?.Token);
-        await WriteRawAsync(FrameType.Auth, hs.CreateAuth1(), ct).ConfigureAwait(false);
+        var token = pairing?.Token; // a copy; zeroed below
+        var hs = new InitiatorHandshake(pcKey, _secure.Identity.PcId, pairing is null ? _secure.Phone!.PublicKey : null, token);
+        bool ok = false;
+        try
+        {
+            await WriteRawAsync(FrameType.Auth, hs.CreateAuth1(), ct).ConfigureAwait(false);
 
-        var a2 = await FrameCodec.ReadAsync(_transport, ct).ConfigureAwait(false);
-        if (a2 is null) throw new ProtocolException("peer closed during handshake");
-        if (a2.Value.Type != FrameType.Auth) throw new ProtocolException($"expected AUTH, got {a2.Value.Type}");
-        var phoneKey = hs.ReadAuth2(a2.Value.Payload.ToArray());
-        var a3 = hs.CreateAuth3();
-        await WriteRawAsync(FrameType.Auth, a3, ct).ConfigureAwait(false);
+            var a2 = await FrameCodec.ReadAsync(_transport, ct, Auth2MaxPayload).ConfigureAwait(false);
+            if (a2 is null) throw new ProtocolException("peer closed during handshake");
+            if (a2.Value.Type != FrameType.Auth) throw new ProtocolException($"expected AUTH, got {a2.Value.Type}");
+            var phoneKey = hs.ReadAuth2(a2.Value.Payload.ToArray());
+            var a3 = hs.CreateAuth3();
+            await WriteRawAsync(FrameType.Auth, a3, ct).ConfigureAwait(false);
 
-        using var keys = hs.Keys; // the channel keeps its own copies; zero ours
-        return (new SealedChannel(keys, isInitiator: true), phoneKey);
+            using var keys = hs.Keys; // the channel keeps its own copies; zero ours
+            var channel = new SealedChannel(keys, isInitiator: true);
+            ok = true;
+            return (channel, phoneKey);
+        }
+        finally
+        {
+            if (!ok) hs.Abort(); // timeout, cancel, transport or protocol failure: zero the ephemeral and DH outputs
+            if (token is not null) CryptographicOperations.ZeroMemory(token);
+        }
     }
 
     async Task TeardownCryptoAsync()
@@ -358,15 +380,19 @@ public sealed class PhoneSession : IAsyncDisposable
     /// <summary>Tells the phone whether to stream video over this link (<c>{"cmd":"route","video":...}</c>).</summary>
     public Task SendRouteAsync(bool video) => SendCmdAsync(new RouteCmd(video));
 
-    /// <summary>Sends <c>{"cmd":"unpair"}</c>, then removes the paired phone from the local store (even if the send failed).</summary>
+    /// <summary>
+    /// Sends <c>{"cmd":"unpair"}</c>, then removes the stored phone, but only if it is the phone of this confirmed session
+    /// (constant-time key compare; a different, newer pairing is left alone). The send is best effort (a dead link must not
+    /// block unpairing locally); a failure to update the store is thrown to the caller. Throws <see cref="InvalidOperationException"/>
+    /// when the session is not confirmed.
+    /// </summary>
     public async Task UnpairAsync()
     {
-        try { await SendCmdAsync(new UnpairCmd()).ConfigureAwait(false); }
-        finally
-        {
-            try { _secure.Store.Unpair(); }
-            catch (Exception e) { PcLog($"unpair: could not update the store: {e.GetType().Name}"); }
-        }
+        if (!_confirmed || _phoneKey is not { } key) throw new InvalidOperationException("session is not confirmed");
+        await SendCmdAsync(new UnpairCmd()).ConfigureAwait(false);
+        var stored = _secure.Store.Phone;
+        if (stored is not null && CryptographicOperations.FixedTimeEquals(stored.PublicKey, key))
+            _secure.Store.Unpair();
     }
 
     public async ValueTask DisposeAsync()

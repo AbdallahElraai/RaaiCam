@@ -45,6 +45,7 @@ sealed class Harness : IAsyncDisposable
     public readonly FakeTimeProvider Time = new();
     public readonly ListLogSink Sink = new();
     public readonly TempDir Dir = new();
+    public readonly FakeProtector Protector = new();
     public readonly PairingStore Store;
     public readonly PcIdentity Identity;
     public readonly StaticKey PhoneKey = StaticKey.Generate();
@@ -65,7 +66,7 @@ sealed class Harness : IAsyncDisposable
     {
         var (client, server) = DuplexStream.CreatePair();
         Phone = server;
-        Store = new PairingStore(Dir.File("pairing.bin"), new FakeProtector(), Sink);
+        Store = new PairingStore(Dir.File("pairing.bin"), Protector, Sink);
         Identity = Store.GetOrCreateIdentity();
         if (mode == LinkMode.Paired) Store.SavePhone(PhoneKey.Public, "iPhone");
         if (mode == LinkMode.PairedWithOtherPhoneKey) Store.SavePhone(StaticKey.Generate().Public, "other");
@@ -605,5 +606,147 @@ public class PhoneSessionTests
         Assert.DoesNotContain(Convert.ToHexString(h.Pairing.Token), all, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(Convert.ToBase64String(h.Identity.PrivateKey), all);
         Assert.DoesNotContain("raaicam://", all);
+    }
+
+    // ---- fix round 1 ----
+
+    [Fact]
+    public async Task Session_UnpairWithFailingSend_StillRemovesLocalPhone()
+    {
+        await using var h = new Harness();
+        await h.HandshakeAsync();
+        h.Phone.Dispose();
+        await h.WaitDisconnectedAsync();
+        await h.Session.UnpairAsync();
+        Assert.Null(h.Store.Phone);
+    }
+
+    [Fact]
+    public async Task Session_UnpairWhenUnconfirmed_ThrowsAndKeepsStore()
+    {
+        await using var h = new Harness();
+        await h.AuthenticateAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => h.Session.UnpairAsync());
+        Assert.NotNull(h.Store.Phone);
+    }
+
+    [Fact]
+    public async Task Session_UnpairLeavesADifferentStoredPhoneAlone()
+    {
+        await using var h = new Harness();
+        await h.HandshakeAsync();
+        var other = StaticKey.Generate().Public;
+        h.Store.SavePhone(other, "newer pairing");
+        await h.Session.UnpairAsync();
+        Assert.Equal(other, h.Store.Phone!.PublicKey);
+    }
+
+    [Fact]
+    public async Task Session_UnpairSurfacesStoreFailure()
+    {
+        await using var h = new Harness();
+        await h.HandshakeAsync();
+        h.Protector.FailProtectWithIo = true;
+        await Assert.ThrowsAsync<IOException>(() => h.Session.UnpairAsync());
+        Assert.NotNull(h.Store.Phone);
+    }
+
+    [Fact]
+    public async Task Session_NoCommandsBeforeConfirmation()
+    {
+        await using var h = new Harness();
+        await h.AuthenticateAsync();
+        await h.Session.StartAsync(1920, 1080);
+        await h.Session.SendRouteAsync(true);
+        await h.SendInfoAsync();
+        // the first sealed frame the phone receives is the PING with counter 0: nothing was sent before confirmation
+        var ping = await h.ReadAsync();
+        Assert.Equal(FrameType.Ping, ping.Type);
+        Assert.Empty(h.Reasons);
+    }
+
+    [Fact]
+    public async Task Session_ConfirmedBeforePhoneIsVisible_CommandAfterPhoneSetIsSent()
+    {
+        await using var h = new Harness();
+        var sent = new TaskCompletionSource();
+        h.Session.Paired += _ => { };
+        await h.AuthenticateAsync();
+        await h.SendInfoAsync();
+        await h.ReadAsync(); // ping
+        Assert.NotNull(h.Session.Phone);
+        await h.Session.StartAsync(1280, 720); // Phone != null implies commands are enabled
+        Assert.Contains("\"start\"", Text(await h.ReadAsync()));
+    }
+
+    [Fact]
+    public async Task Session_DisposeDuringConfirmationWindow_DisconnectsPromptly()
+    {
+        var h = new Harness();
+        await h.AuthenticateAsync();
+        await h.Session.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        await h.Run.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "disposed" }, h.Reasons);
+        Assert.Null(h.Session.Phone);
+        await h.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Session_PairingSaveFailure_DoesNotExposePhoneOrRaisePaired()
+    {
+        await using var h = new Harness(LinkMode.Pairing);
+        await h.AuthenticateAsync();
+        h.Protector.FailProtectWithIo = true; // the identity is already on disk; the SavePhone write fails
+        await h.SendInfoAsync();
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("could not save pairing", Assert.Single(h.Reasons));
+        Assert.Null(h.Session.Phone);
+        Assert.Null(h.Session.PhoneStaticKey);
+        Assert.Empty(h.PairedEvents);
+        Assert.Null(h.Store.Phone);
+    }
+
+    [Fact]
+    public async Task Session_OversizedHello_Disconnects()
+    {
+        await using var h = new Harness();
+        h.StartRun();
+        await h.ReadRawAsync();
+        await h.SendRawAsync(FrameType.Hello, new byte[2000]);
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("exceeds max 1024", Assert.Single(h.Reasons));
+    }
+
+    [Fact]
+    public async Task Session_Auth2WrongLength_Disconnects()
+    {
+        await using var h = new Harness();
+        h.StartRun();
+        await h.ReadRawAsync();
+        await h.SendPhoneHelloAsync();
+        await h.ReadRawAsync();
+        await h.SendRawAsync(FrameType.Auth, new byte[81]);
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("protocol", Assert.Single(h.Reasons));
+    }
+
+    [Fact]
+    public async Task Session_InfoDeviceIsSanitized()
+    {
+        await using var h = new Harness(LinkMode.Pairing);
+        await h.AuthenticateAsync();
+        var evil = "\u202Efoo\u0007\r\nbar" + new string('x', 100);
+        await h.SendInfoAsync("{\"app\":\"A\",\"version\":\"1\",\"device\":\"" + evil.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\u0007", "\\u0007") + "\",\"os\":\"i\"}");
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await h.PairedSignal.WaitAsync(cts.Token);
+        var device = h.Session.Phone!.Device;
+        Assert.Equal(64, device.Length);
+        Assert.StartsWith("foobar", device);
+        Assert.All(device, c => Assert.False(char.IsControl(c) || c == '\u202E'));
+        Assert.Equal(device, h.Store.Phone!.Label);
+        Assert.All(h.Sink.Snapshot(), l => Assert.DoesNotContain('\u202E', l.Line));
     }
 }

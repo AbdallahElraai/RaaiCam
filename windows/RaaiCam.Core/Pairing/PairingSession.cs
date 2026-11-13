@@ -57,15 +57,32 @@ public sealed class PairingSession
 /// <summary>Renders the pairing URL as a terminal QR code.</summary>
 public static class PairingQr
 {
+    const string Reset = "\u001b[0m";
+    const string Dark = "\u001b[40m";    // black background
+    const string Light = "\u001b[107m";  // bright white background
+
     /// <summary>
-    /// Two characters per module (block characters) so the code renders square in a terminal. The console must be
-    /// UTF-8 (<c>Console.OutputEncoding</c>). Includes the quiet zone.
+    /// Black modules on a white background with explicit ANSI background colours (two spaces per module, so it renders
+    /// square, and a 4-module white quiet zone), so it scans on dark terminals too. Needs a VT-capable console (Windows
+    /// Terminal, or conhost with virtual-terminal processing); no UTF-8 requirement. Lines end with a colour reset.
     /// </summary>
     public static string ToConsoleString(string url)
     {
         using var gen = new QRCodeGenerator();
         using var data = gen.CreateQrCode(url, QRCodeGenerator.ECCLevel.M);
-        using var ascii = new AsciiQRCode(data);
-        return ascii.GetGraphic(1, "██", "  ", true, "\n");
+        var m = data.ModuleMatrix; // includes the 4-module quiet zone
+        var sb = new StringBuilder();
+        foreach (var row in m)
+        {
+            bool? prev = null;
+            foreach (bool dark in row)
+            {
+                if (prev != dark) sb.Append(dark ? Dark : Light);
+                sb.Append("  ");
+                prev = dark;
+            }
+            sb.Append(Reset).Append('\n');
+        }
+        return sb.ToString();
     }
 }

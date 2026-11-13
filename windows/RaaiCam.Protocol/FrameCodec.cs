@@ -41,8 +41,9 @@ public static class FrameCodec
         s.Write(payload);
     }
 
+    /// <summary><paramref name="maxPayload"/> is a per-phase cap (e.g. 1 KiB for HELLO) applied before the payload is allocated.</summary>
     /// <summary>Returns null on clean EOF at a frame boundary; throws ProtocolException on oversize or truncation.</summary>
-    public static async ValueTask<Frame?> ReadAsync(Stream s, CancellationToken ct)
+    public static async ValueTask<Frame?> ReadAsync(Stream s, CancellationToken ct, int maxPayload = MaxPayload)
     {
         var header = new byte[HeaderSize];
         int got = await ReadFullAsync(s, header, ct).ConfigureAwait(false);
@@ -50,7 +51,7 @@ public static class FrameCodec
         if (got < HeaderSize) throw new ProtocolException("truncated frame header");
 
         uint length = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(1));
-        if (length > MaxPayload) throw new ProtocolException($"frame length {length} exceeds max {MaxPayload}");
+        if (length > (uint)Math.Min(maxPayload, MaxPayload)) throw new ProtocolException($"frame length {length} exceeds max {Math.Min(maxPayload, MaxPayload)}");
 
         var payload = new byte[length];
         got = await ReadFullAsync(s, payload, ct).ConfigureAwait(false);

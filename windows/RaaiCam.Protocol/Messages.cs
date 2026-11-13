@@ -75,6 +75,33 @@ public static class Messages
 
     sealed record InfoWire(string? App, string? Version, string? Device, string? Os);
 
+    public const int MaxInfoFieldLength = 64;
+
+    /// <summary>Strips control, format (bidi etc.), separator and unpaired-surrogate characters and caps the length; INFO text is attacker-influenced display/log text.</summary>
+    public static string Sanitize(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new System.Text.StringBuilder(Math.Min(s.Length, MaxInfoFieldLength));
+        for (int k = 0; k < s.Length && sb.Length < MaxInfoFieldLength; k++)
+        {
+            char c = s[k];
+            if (char.IsHighSurrogate(c) && k + 1 < s.Length && char.IsLowSurrogate(s[k + 1]))
+            {
+                if (sb.Length + 2 > MaxInfoFieldLength) break;
+                sb.Append(c).Append(s[k + 1]);
+                k++;
+                continue;
+            }
+            if (char.IsSurrogate(c)) continue;
+            var cat = char.GetUnicodeCategory(c);
+            if (char.IsControl(c) || cat is System.Globalization.UnicodeCategory.Format or System.Globalization.UnicodeCategory.LineSeparator
+                or System.Globalization.UnicodeCategory.ParagraphSeparator or System.Globalization.UnicodeCategory.OtherNotAssigned
+                or System.Globalization.UnicodeCategory.PrivateUse) continue;
+            sb.Append(c);
+        }
+        return sb.ToString().Trim();
+    }
+
     /// <summary>Parses the encrypted INFO frame (sent by the phone as its first sealed frame) into a HelloInfo.</summary>
     public static HelloInfo ParseInfo(ReadOnlySpan<byte> payload)
     {
@@ -82,7 +109,7 @@ public static class Messages
         try { i = JsonSerializer.Deserialize<InfoWire>(payload, Json); }
         catch (JsonException e) { throw new ProtocolException("invalid INFO json", e); }
         if (i is null) throw new ProtocolException("empty INFO");
-        return new HelloInfo(ProtoVersion, "phone", i.App ?? "", i.Version ?? "", i.Device ?? "", i.Os ?? "");
+        return new HelloInfo(ProtoVersion, "phone", Sanitize(i.App), Sanitize(i.Version), Sanitize(i.Device), Sanitize(i.Os));
     }
 
     public static byte[] Cmd(object cmd) => JsonSerializer.SerializeToUtf8Bytes(cmd, cmd.GetType(), Json);
