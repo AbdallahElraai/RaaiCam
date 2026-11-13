@@ -1,0 +1,46 @@
+name: ios
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - 'protocol/**'
+      - '.github/workflows/ios.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate --spec ios/project.yml
+      - name: Unit tests (simulator)
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild -version
+          NAME=$(xcrun simctl list devices available | grep -E '^ +iPhone' | head -1 | sed -E 's/^ +//; s/ \([0-9A-F-]{36}\).*//')
+          echo "Simulator: $NAME"
+          xcodebuild test -project ios/RaaiCam.xcodeproj -scheme RaaiCam \
+            -destination "platform=iOS Simulator,name=$NAME" \
+            -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO 2>&1 | tee test.log | tail -n 200
+          grep -E "Executed [0-9]+ tests" test.log | tail -n 3
+      - name: Build device (unsigned)
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild build -project ios/RaaiCam.xcodeproj -scheme RaaiCam \
+            -configuration Release -sdk iphoneos -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -n 60
+      - name: Package ipa
+        run: |
+          mkdir Payload
+          cp -r build/Build/Products/Release-iphoneos/RaaiCam.app Payload/
+          zip -r RaaiCam.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RaaiCam-ipa
+          path: RaaiCam.ipa

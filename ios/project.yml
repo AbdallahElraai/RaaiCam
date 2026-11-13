@@ -1,0 +1,58 @@
+name: RaaiCam
+options:
+  bundleIdPrefix: com.raaicam
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  RaaiCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: RaaiCam
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: "RaaiCam uses the camera to stream video to your PC."
+        NSLocalNetworkUsageDescription: "RaaiCam connects to your PC to stream video."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.raaicam.app
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+  RaaiCamTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests
+      - path: ../protocol/test-vectors.json
+        buildPhase: resources
+    dependencies:
+      - target: RaaiCam
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.raaicam.app.tests
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  RaaiCam:
+    build:
+      targets:
+        RaaiCam: all
+        RaaiCamTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - RaaiCamTests
