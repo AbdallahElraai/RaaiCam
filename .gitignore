@@ -11,3 +11,4 @@ spikes/out/
 spikes/_ref/
 *.bmp
 windows/out/
+ios/Sources/Info.plist

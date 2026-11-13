@@ -151,3 +151,26 @@ final class ProtocolTests: XCTestCase {
         XCTAssertFalse(PeerAddress.isLoopback(v6: mapped))
     }
 }
+
+final class ValidationTests: XCTestCase {
+    func testStartCommandSanitized() {
+        let ok = StartCommand(width: 1280, height: 720, fps: 30, lens: .wide, bitrateKbps: 6000).sanitized()
+        XCTAssertEqual(ok.command.width, 1280)
+        XCTAssertTrue(ok.warnings.isEmpty)
+
+        let bad = StartCommand(width: 99999, height: -5, fps: 0, lens: .ultra, bitrateKbps: Int.max).sanitized()
+        XCTAssertEqual(bad.command, StartCommand(width: 1920, height: 1080, fps: 30, lens: .ultra, bitrateKbps: 20000))
+        XCTAssertEqual(bad.warnings.count, 3)
+
+        XCTAssertEqual(StartCommand.clampKbps(Int.min), 500)
+        XCTAssertEqual(StartCommand(width: 1920, height: 1080, fps: 1000, lens: .wide, bitrateKbps: 1).sanitized().command.fps, 30)
+    }
+
+    func testPeerAllowedIncludesSelfAddress() {
+        XCTAssertTrue(PeerAddress.isAllowed(family: AF_INET, peer: [127, 0, 0, 1], local: [10, 0, 0, 5]))
+        XCTAssertTrue(PeerAddress.isAllowed(family: AF_INET, peer: [10, 0, 0, 5], local: [10, 0, 0, 5]))
+        XCTAssertFalse(PeerAddress.isAllowed(family: AF_INET, peer: [10, 0, 0, 9], local: [10, 0, 0, 5]))
+        XCTAssertFalse(PeerAddress.isAllowed(family: AF_INET, peer: [10, 0, 0, 9], local: []))
+        XCTAssertEqual(PeerAddress.describe(family: AF_INET, bytes: [10, 0, 0, 9]), "10.0.0.9")
+    }
+}

@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
@@ -26,7 +27,7 @@ jobs:
           echo "Simulator: $NAME"
           xcodebuild test -project ios/RaaiCam.xcodeproj -scheme RaaiCam \
             -destination "platform=iOS Simulator,name=$NAME" \
-            -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO 2>&1 | tee test.log | tail -n 200
+            -derivedDataPath build-sim -resultBundlePath TestResults.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee test.log | tail -n 200
           grep -E "Executed [0-9]+ tests" test.log | tail -n 3
       - name: Build device (unsigned)
         shell: bash
@@ -44,3 +45,8 @@ jobs:
         with:
           name: RaaiCam-ipa
           path: RaaiCam.ipa
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: TestResults-xcresult
+          path: TestResults.xcresult

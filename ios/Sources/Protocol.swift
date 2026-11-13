@@ -197,3 +197,55 @@ enum PeerAddress {
         return mappedPrefix && b[12] == 127 && b[13] == 0 && b[14] == 0 && b[15] == 1
     }
 }
+
+extension PeerAddress {
+    /// Loopback peers are allowed; so is a peer whose address equals the socket's own local
+    /// address (the device connecting to itself cannot originate from the network).
+    static func isAllowed(family: Int32, peer: [UInt8], local: [UInt8]) -> Bool {
+        if family == AF_INET {
+            guard peer.count == 4 else { return false }
+            let v = peer.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+            return isLoopback(v4: v) || peer == local
+        }
+        if family == AF_INET6 {
+            return isLoopback(v6: peer) || (peer.count == 16 && peer == local)
+        }
+        return false
+    }
+
+    static func describe(family: Int32, bytes: [UInt8]) -> String {
+        if family == AF_INET && bytes.count == 4 { return bytes.map(String.init).joined(separator: ".") }
+        if bytes.count == 16 {
+            return stride(from: 0, to: 16, by: 2).map { String(format: "%x", Int(bytes[$0]) << 8 | Int(bytes[$0 + 1])) }
+                .joined(separator: ":")
+        }
+        return "unknown"
+    }
+}
+
+extension StartCommand {
+    static let supportedSizes: [(Int, Int)] = [(1920, 1080), (1280, 720)]
+    static let kbpsRange = 500...20000
+
+    static func clampKbps(_ k: Int) -> Int { min(max(k, kbpsRange.lowerBound), kbpsRange.upperBound) }
+
+    /// Validates untrusted PC input: size must be one of the two supported sizes (else 1920x1080),
+    /// fps must be 1...60 (else 30; the capture layer later clamps to the device's real ranges),
+    /// bitrate is clamped to 500...20000 kbps. Returns the sanitized command plus warning lines.
+    func sanitized() -> (command: StartCommand, warnings: [String]) {
+        var c = self
+        var w = [String]()
+        if !Self.supportedSizes.contains(where: { $0.0 == width && $0.1 == height }) {
+            w.append("W unsupported size \(width)x\(height), using 1920x1080")
+            c.width = 1920; c.height = 1080
+        }
+        if !(1...60).contains(fps) {
+            w.append("W unsupported fps \(fps), using 30")
+            c.fps = 30
+        }
+        let k = Self.clampKbps(bitrateKbps)
+        if k != bitrateKbps { w.append("W bitrate \(bitrateKbps) kbps clamped to \(k)") }
+        c.bitrateKbps = k
+        return (c, w)
+    }
+}

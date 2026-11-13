@@ -11,6 +11,8 @@ struct EncodedFrame {
 /// Hardware H.264 High encoder (FR-STR-3): RealTime, no frame reordering,
 /// keyframe every 60 frames and on request, average bitrate + 1.5x data-rate cap.
 final class H264Encoder {
+    /// `sessionLock` makes encode()/set()/stop() mutually exclusive: the session is never released mid-encode.
+    private let sessionLock = NSLock()
     private var session: VTCompressionSession?
     private let onFrame: (EncodedFrame) -> Void
     private let onLog: (String) -> Void
@@ -23,6 +25,9 @@ final class H264Encoder {
         self.height = height
         self.onFrame = onFrame
         self.onLog = onLog
+        guard (16...8192).contains(width), (16...8192).contains(height), (1...240).contains(fps) else {
+            throw EncoderError.badParameters
+        }
 
         var s: VTCompressionSession?
         let status = VTCompressionSessionCreate(
@@ -45,6 +50,7 @@ final class H264Encoder {
     deinit { stop() }
 
     private func set(_ key: CFString, _ value: CFTypeRef) {
+        sessionLock.lock(); defer { sessionLock.unlock() }
         guard let session = session else { return }
         let st = VTSessionSetProperty(session, key: key, value: value)
         if st != noErr { onLog("W encoder property \(key) failed: \(st)") }
@@ -52,7 +58,7 @@ final class H264Encoder {
 
     private func applyBitrate(kbps: Int) {
         let bytesPerSecond = Double(kbps) * 1000.0 / 8.0
-        set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: kbps * 1000))
+        set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: Int64(kbps) * 1000))
         let limits: [NSNumber] = [NSNumber(value: bytesPerSecond * 1.5), NSNumber(value: 1.0)]
         set(kVTCompressionPropertyKey_DataRateLimits, limits as CFArray)
     }
@@ -67,6 +73,7 @@ final class H264Encoder {
     }
 
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, duration: CMTime) {
+        sessionLock.lock(); defer { sessionLock.unlock() }
         guard let session = session else { return }
         forceLock.lock(); let force = forceNext; forceNext = false; forceLock.unlock()
         let props: CFDictionary? = force
@@ -87,8 +94,11 @@ final class H264Encoder {
     }
 
     func stop() {
-        guard let s = session else { return }
+        sessionLock.lock()
+        let s = session
         session = nil
+        sessionLock.unlock()
+        guard let s = s else { return }
         VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid)
         VTCompressionSessionInvalidate(s)
     }
@@ -145,4 +155,5 @@ final class H264Encoder {
 
 enum EncoderError: Error {
     case create(OSStatus)
+    case badParameters
 }
