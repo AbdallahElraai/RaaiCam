@@ -70,5 +70,6 @@ set_target_properties(vcamctl PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY
 
 # Headless capture probe: classifies card / live / torn frames from the installed camera.
 add_executable(vcam-probe probe/main.cpp)
+target_include_directories(vcam-probe PRIVATE src)
 target_link_libraries(vcam-probe PRIVATE mf mfplat mfreadwrite mfuuid ole32)
 set_target_properties(vcam-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

@@ -1,12 +1,13 @@
 // vcam-probe: headless capture probe for the RaaiCam virtual camera.
 //
-//   vcam-probe.exe --name RaaiCam --width W --height H --frames N --json out.json [--trace 1]
+//   vcam-probe.exe --name RaaiCam --width W --height H --frames N --json out.json [--trace 1] [--expect camera]
 //
 // Opens the named camera with IMFSourceReader, reads N NV12 frames and classifies each one:
 //   card  = placeholder card: corner Y == 0x20 and center Y in 0xA0..0xC0
 //   live  = the 64-bit frame id (TestPatternSource encoding) decodes cleanly in the top Y row
 //   torn  = a live frame whose bottom-row id differs from its top-row id (or does not decode)
 //   other = neither card nor live (reported separately, first few logged with mean Y)
+//   camera = other AND luma variance > raaicam::kCameraMinVariance (cameraFrames; meanVariance = mean over all frames)
 // Prints one JSON object (also written to --json):
 //   {"opened":bool,"fps":double,"cardFrames":int,"liveFrames":int,"tornFrames":int,"distinctFrameIds":int,"error":"..."|null, ...}
 // stdout also carries a per-frame class TRANSITION log with wall-clock epoch milliseconds (wall_ms=).
@@ -25,6 +26,8 @@
 #include <atomic>
 #include <mutex>
 
+#include "FrameClassifier.h"
+
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfreadwrite.lib")
@@ -35,6 +38,7 @@ template <class T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = n
 
 static std::wstring g_jsonPath;
 static bool g_trace = false;
+static std::wstring g_expect;
 static std::mutex g_outMutex;
 static std::atomic<bool> g_written{ false };
 
@@ -43,7 +47,8 @@ struct Result
 	bool opened = false;
 	double fps = 0, fpsTs = 0;
 	int frames = 0, card = 0, live = 0, torn = 0, other = 0;
-	int distinct = 0, maxDupRun = 0;
+	int distinct = 0, maxDupRun = 0, camera = 0;
+	double varSum = 0;
 	uint64_t maxIdJump = 0, maxIdBackStep = 0;
 	UINT32 w = 0, h = 0;
 	std::string error;
@@ -76,11 +81,11 @@ static void EmitJson(const Result& r)
 {
 	std::lock_guard<std::mutex> lock(g_outMutex);
 	if (g_written.exchange(true)) return;
-	char buf[1024];
+	char buf[1280];
 	snprintf(buf, sizeof(buf),
 		"{\"opened\":%s,\"fps\":%.2f,\"fpsByTimestamp\":%.2f,\"frames\":%d,\"width\":%u,\"height\":%u,"
-		"\"cardFrames\":%d,\"liveFrames\":%d,\"tornFrames\":%d,\"otherFrames\":%d,\"distinctFrameIds\":%d,\"maxDupRun\":%d,\"maxIdJump\":%llu,\"maxIdBackStep\":%llu,\"error\":",
-		r.opened ? "true" : "false", r.fps, r.fpsTs, r.frames, r.w, r.h, r.card, r.live, r.torn, r.other, r.distinct, r.maxDupRun, (unsigned long long)r.maxIdJump, (unsigned long long)r.maxIdBackStep);
+		"\"cardFrames\":%d,\"liveFrames\":%d,\"tornFrames\":%d,\"otherFrames\":%d,\"distinctFrameIds\":%d,\"maxDupRun\":%d,\"maxIdJump\":%llu,\"maxIdBackStep\":%llu,\"cameraFrames\":%d,\"meanVariance\":%.2f,\"error\":",
+		r.opened ? "true" : "false", r.fps, r.fpsTs, r.frames, r.w, r.h, r.card, r.live, r.torn, r.other, r.distinct, r.maxDupRun, (unsigned long long)r.maxIdJump, (unsigned long long)r.maxIdBackStep, r.camera, r.frames > 0 ? r.varSum / r.frames : 0.0);
 	std::string json = buf;
 	json += r.hasError ? "\"" + Esc(r.error) + "\"" : "null";
 	json += "}";
@@ -171,6 +176,7 @@ int wmain(int argc, wchar_t** argv)
 		else if (a == L"--height") wantH = (UINT32)_wtoi(argv[i + 1]);
 		else if (a == L"--json") g_jsonPath = argv[i + 1];
 		else if (a == L"--trace") g_trace = _wtoi(argv[i + 1]) != 0;
+		else if (a == L"--expect") g_expect = argv[i + 1];  // "camera": informational; cameraFrames is always reported
 	}
 
 	Result r;
@@ -357,7 +363,7 @@ int wmain(int argc, wchar_t** argv)
 				if (!DecodeId(y + (size_t)(h - 1) * w, w, botId) || botId != topId)
 					r.torn++;
 			}
-			else if (corner == 0x20 && center >= 0xA0 && center <= 0xC0)
+			else if (raaicam::IsCardSignature(y, w, h))
 			{
 				cls = CardCls;
 				r.card++;
@@ -371,6 +377,9 @@ int wmain(int argc, wchar_t** argv)
 				if (otherLogged++ < 5)
 					printf("  OTHER frame %d meanY=%.2f corner=0x%02X center=0x%02X\n", got, MeanY(y, w, h), corner, center);
 			}
+			const double variance = raaicam::LumaVariance(y, w, h);
+			r.varSum += variance;
+			if (raaicam::IsCameraFrame(cls == CardCls, cls == LiveCls, variance)) r.camera++;
 			if (g_trace)
 				printf("  F %d cls=%d id=%llu wall_ms=%lld ts=%lld\n", got, cls, (unsigned long long)topId, wall, (long long)ts);
 			if (cls != prevCls)

@@ -7,6 +7,36 @@ using RaaiCam.HostApp;
 using RaaiCam.Media;
 
 // raaicam-host: phone (USB) -> H.264 decoder -> RaaiCam virtual camera.
+if (args.Contains("--list-devices"))
+{
+    // Preflight for run-phone-checks.ps1: "devices=N", "app=reachable|unreachable|n/a". Exit 0 when a device is attached.
+    using var lcts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    var usb = new UsbmuxClient();
+    IReadOnlyList<UsbDevice> devs;
+    try { devs = await usb.ListDevicesAsync(lcts.Token); }
+    catch (Exception e) when (e is UsbmuxUnavailableException or UsbmuxException or OperationCanceledException or IOException)
+    {
+        Console.WriteLine("devices=0");
+        Console.WriteLine("app=n/a");
+        Console.WriteLine("error=" + e.Message);
+        return 2;
+    }
+    Console.WriteLine($"devices={devs.Count}");
+    if (devs.Count == 0) { Console.WriteLine("app=n/a"); return 2; }
+    string app;
+    try
+    {
+        await using var s = await usb.ConnectAsync(devs[0].DeviceId, 47820, lcts.Token);
+        app = "reachable";
+    }
+    catch (Exception e) when (e is UsbmuxException or UsbmuxUnavailableException or IOException or OperationCanceledException)
+    {
+        app = "unreachable";
+    }
+    Console.WriteLine($"app={app}");
+    return 0;
+}
+
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {

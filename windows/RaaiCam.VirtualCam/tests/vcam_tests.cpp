@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "ActiveStreamSet.h"
+#include "FrameClassifier.h"
 #include "FrameReader.h"
 #include "PlaceholderCard.h"
 #include "Security.h"
@@ -476,4 +477,43 @@ TEST_CASE("ActiveStreamSet_RestartMakesStreamMostRecent") {
   s.Start(&a, 1920, 1080);  // a restarted
   REQUIRE(s.Current(w, h));
   CHECK((w == 1920 && h == 1080));
+}
+TEST_CASE("Classifier_CardIsCardSignatureAndNotCamera") {
+  for (uint32_t w : {1280u, 1920u}) {
+    const uint32_t h = w == 1280 ? 720 : 1080;
+    for (uint64_t tick : {0ull, 15ull, 30ull, 45ull}) {
+      std::vector<uint8_t> f(size_t(w) * h * 3 / 2);
+      DrawPlaceholderCard(f.data(), w, w, h, tick);
+      CHECK(IsCardSignature(f.data(), w, h));
+      const double v = LumaVariance(f.data(), w, h);
+      CHECK(v > 300);  // the card (about 450 at 16:9) is not flat: the signature, not variance, is what excludes it
+      CHECK(v < 700);
+      CHECK_FALSE(IsCameraFrame(true, false, v));
+    }
+  }
+}
+
+TEST_CASE("Classifier_FlatFramesAreNotCamera") {
+  std::vector<uint8_t> black(1280 * 720, 0x10), grey(1280 * 720, 0x80);
+  CHECK(LumaVariance(black.data(), 1280, 720) == doctest::Approx(0.0));
+  CHECK_FALSE(IsCameraFrame(false, false, LumaVariance(black.data(), 1280, 720)));
+  CHECK_FALSE(IsCameraFrame(false, false, LumaVariance(grey.data(), 1280, 720)));
+  CHECK_FALSE(IsCardSignature(black.data(), 1280, 720));
+}
+
+TEST_CASE("Classifier_NoisyOrGradientFramesAreCamera") {
+  const uint32_t w = 1280, h = 720;
+  std::vector<uint8_t> grad(size_t(w) * h);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) grad[size_t(y) * w + x] = uint8_t(40 + (x * 160) / w);
+  const double v = LumaVariance(grad.data(), w, h);
+  CHECK(v > kCameraMinVariance);
+  CHECK(IsCameraFrame(false, false, v));
+  CHECK_FALSE(IsCameraFrame(false, true, v));  // a test-pattern (live) frame is never camera
+
+  // plain wall: noise of roughly 10 levels stddev is still above the gate
+  std::vector<uint8_t> wall(size_t(w) * h);
+  uint32_t seed = 12345;
+  for (auto& p : wall) { seed = seed * 1664525u + 1013904223u; p = uint8_t(120 + int((seed >> 24) % 35) - 17); }
+  CHECK(IsCameraFrame(false, false, LumaVariance(wall.data(), w, h)));
 }
