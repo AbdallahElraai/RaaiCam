@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
 using System.Text;
+using RaaiCam.Core.Pairing;
 using RaaiCam.Core.Phone;
 using RaaiCam.Protocol;
+using RaaiCam.Protocol.Crypto;
 
 namespace RaaiCam.Core.Tests;
 
@@ -30,41 +32,76 @@ sealed class ListLogSink : ILogSink
     }
 }
 
-/// <summary>Session under test plus the scripted phone end of an in-memory transport.</summary>
+enum LinkMode { Paired, Pairing, PairedWithOtherPhoneKey }
+
+/// <summary>
+/// Session under test plus a scripted phone: the C# <see cref="ResponderHandshake"/> and <see cref="SealedChannel"/>
+/// over an in-memory transport. Before the handshake completes ReadAsync/SendAsync are raw; afterwards they seal/open.
+/// </summary>
 sealed class Harness : IAsyncDisposable
 {
     public readonly PhoneSession Session;
     public readonly Stream Phone;
     public readonly FakeTimeProvider Time = new();
     public readonly ListLogSink Sink = new();
+    public readonly TempDir Dir = new();
+    public readonly PairingStore Store;
+    public readonly PcIdentity Identity;
+    public readonly StaticKey PhoneKey = StaticKey.Generate();
+    public readonly PairingSession? Pairing;
+    public SealedChannel? Chan;
     public ulong NowUs = 1_000_000;
     public readonly List<string> Reasons = new();
+    public readonly List<PairedPhone> PairedEvents = new();
     public readonly SemaphoreSlim DisconnectedSignal = new(0);
+    public readonly SemaphoreSlim PairedSignal = new(0);
     public Task Run = Task.CompletedTask;
     readonly CancellationTokenSource _cts = new(TimeSpan.FromSeconds(20));
     int _barrier;
 
-    public Harness()
+    public const string InfoJson = "{\"app\":\"RaaiCam\",\"version\":\"1.0\",\"device\":\"iPhone 15\",\"os\":\"iOS 18\"}";
+
+    public Harness(LinkMode mode = LinkMode.Paired)
     {
         var (client, server) = DuplexStream.CreatePair();
         Phone = server;
-        Session = new PhoneSession(client, () => NowUs, Sink, Time);
+        Store = new PairingStore(Dir.File("pairing.bin"), new FakeProtector(), Sink);
+        Identity = Store.GetOrCreateIdentity();
+        if (mode == LinkMode.Paired) Store.SavePhone(PhoneKey.Public, "iPhone");
+        if (mode == LinkMode.PairedWithOtherPhoneKey) Store.SavePhone(StaticKey.Generate().Public, "other");
+        if (mode == LinkMode.Pairing) Pairing = PairingSession.Begin(Identity, "Test PC", TimeProvider.System);
+        var options = new SecureLinkOptions(Identity, Store, mode == LinkMode.Pairing ? null : Store.Phone, Pairing);
+        Session = new PhoneSession(client, () => NowUs, Sink, options, Time);
         Session.Disconnected += r =>
         {
             lock (Reasons) Reasons.Add(r);
             DisconnectedSignal.Release();
         };
+        Session.Paired += p =>
+        {
+            lock (PairedEvents) PairedEvents.Add(p);
+            PairedSignal.Release();
+        };
     }
 
     public void StartRun() => Run = Session.RunAsync(_cts.Token);
 
-    public async Task<Frame> ReadAsync()
+    public async Task<Frame> ReadRawAsync()
     {
         var f = await FrameCodec.ReadAsync(Phone, _cts.Token);
         return f ?? throw new InvalidOperationException("session closed transport");
     }
 
-    public async Task SendAsync(FrameType t, ReadOnlyMemory<byte> payload)
+    /// <summary>Raw before the handshake finished; the opened inner frame afterwards.</summary>
+    public async Task<Frame> ReadAsync()
+    {
+        var f = await ReadRawAsync();
+        if (Chan is null) return f;
+        Assert.Equal(FrameType.Sealed, f.Type);
+        return Chan.Open(f.Payload.Span);
+    }
+
+    public async Task SendRawAsync(FrameType t, ReadOnlyMemory<byte> payload)
     {
         var buf = new byte[FrameCodec.HeaderSize + payload.Length];
         buf[0] = (byte)t;
@@ -73,16 +110,39 @@ sealed class Harness : IAsyncDisposable
         await Phone.WriteAsync(buf, _cts.Token);
     }
 
-    public Task SendPhoneHelloAsync() =>
-        SendAsync(FrameType.Hello, Messages.Hello("phone"));
+    public Task SendAsync(FrameType t, ReadOnlyMemory<byte> payload) =>
+        Chan is null ? SendRawAsync(t, payload) : SendRawAsync(FrameType.Sealed, Chan.Seal(t, payload.Span));
 
-    /// <summary>HELLO exchange; returns the first PING frame (sent right after the exchange).</summary>
-    public async Task<Frame> HandshakeAsync()
+    public Task SendPhoneHelloAsync() =>
+        SendRawAsync(FrameType.Hello, Messages.Hello("phone"));
+
+    /// <summary>HELLO exchange, then the phone side of AUTH1..AUTH3. Leaves the phone sealed channel in <see cref="Chan"/>; no INFO sent.</summary>
+    public async Task AuthenticateAsync()
     {
         StartRun();
-        var hello = await ReadAsync();
+        var hello = await ReadRawAsync();
         Assert.Equal(FrameType.Hello, hello.Type);
         await SendPhoneHelloAsync();
+        var a1 = await ReadRawAsync();
+        Assert.Equal(FrameType.Auth, a1.Type);
+        PairingTokenCheck? tc = Pairing is null ? null
+            : new PairingTokenCheck(Pairing.Token, Pairing.ExpiresAt, Identity.PublicKey, () => true);
+        using var resp = new ResponderHandshake(PhoneKey, pub => pub.AsSpan().SequenceEqual(Identity.PublicKey), tc);
+        var a2 = resp.ReadAuth1AndCreateAuth2(a1.Payload.ToArray());
+        await SendRawAsync(FrameType.Auth, a2);
+        var a3 = await ReadRawAsync();
+        Assert.Equal(FrameType.Auth, a3.Type);
+        resp.ReadAuth3(a3.Payload.ToArray());
+        Chan = new SealedChannel(resp.Keys, isInitiator: false);
+    }
+
+    public Task SendInfoAsync(string json = InfoJson) => SendAsync(FrameType.Info, Encoding.UTF8.GetBytes(json));
+
+    /// <summary>Full connect; returns the first PING frame (sent right after confirmation).</summary>
+    public async Task<Frame> HandshakeAsync()
+    {
+        await AuthenticateAsync();
+        await SendInfoAsync();
         var ping = await ReadAsync();
         Assert.Equal(FrameType.Ping, ping.Type);
         return ping;
@@ -107,6 +167,8 @@ sealed class Harness : IAsyncDisposable
         await Session.DisposeAsync();
         Phone.Dispose();
         _cts.Cancel();
+        Chan?.Dispose();
+        Dir.Dispose();
     }
 }
 
@@ -119,16 +181,203 @@ public class PhoneSessionTests
     {
         await using var h = new Harness();
         h.StartRun();
-        var first = await h.ReadAsync();
+        var first = await h.ReadRawAsync();
         Assert.Equal(FrameType.Hello, first.Type);
         var hello = Messages.ParseHello(first.Payload.Span);
         Assert.Equal("pc", hello.Role);
         Assert.Equal(2, hello.Proto);
         Assert.Null(h.Session.Phone);
+        Assert.Equal("{\"proto\":2,\"role\":\"pc\"}", Text(first));
+    }
 
+    [Fact]
+    public async Task Session_FullHandshakeAgainstCSharpResponder()
+    {
+        await using var h = new Harness();
+        await h.AuthenticateAsync();
+        Assert.Null(h.Session.Phone); // not before the INFO frame opens
+        await h.SendInfoAsync();
+        var ping = await h.ReadAsync();
+        Assert.Equal(FrameType.Ping, ping.Type);
+        var phone = h.Session.Phone!;
+        Assert.Equal("iPhone 15", phone.Device);
+        Assert.Equal("iOS 18", phone.Os);
+        Assert.Equal("RaaiCam", phone.App);
+        Assert.Equal("1.0", phone.Version);
+        Assert.Equal(h.PhoneKey.Public, h.Session.PhoneStaticKey);
+        Assert.Empty(h.Reasons);
+        Assert.Empty(h.PairedEvents); // mode 1 never raises Paired
+    }
+
+    [Fact]
+    public async Task Session_PairingModeRaisesPaired()
+    {
+        await using var h = new Harness(LinkMode.Pairing);
+        await h.HandshakeAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await h.PairedSignal.WaitAsync(cts.Token);
+        var p = Assert.Single(h.PairedEvents);
+        Assert.Equal(h.PhoneKey.Public, p.PublicKey);
+        Assert.Equal("iPhone 15", p.Label);
+        Assert.Equal(h.PhoneKey.Public, h.Store.Phone!.PublicKey);
+        Assert.True(h.Pairing!.IsUsed);
+        // a fresh store instance sees the pairing too
+        Assert.Equal(h.PhoneKey.Public, new PairingStore(h.Dir.File("pairing.bin"), new FakeProtector()).Phone!.PublicKey);
+    }
+
+    [Fact]
+    public async Task Session_PairingSavesPhoneOnlyAfterConfirmation()
+    {
+        await using var h = new Harness(LinkMode.Pairing);
+        await h.AuthenticateAsync();
+        // AUTH3 sent and verified by the phone, but no INFO yet: nothing stored, nothing raised
+        await Task.Delay(200);
+        Assert.Null(h.Store.Phone);
+        Assert.Empty(h.PairedEvents);
+        Assert.Null(h.Session.Phone);
+        await h.SendInfoAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await h.PairedSignal.WaitAsync(cts.Token);
+        Assert.NotNull(h.Store.Phone);
+    }
+
+    [Fact]
+    public async Task Session_PairingNotSavedWhenConfirmationFails()
+    {
+        await using var h = new Harness(LinkMode.Pairing);
+        await h.AuthenticateAsync();
+        await h.SendAsync(FrameType.Log, "W nope"u8.ToArray()); // first frame is not INFO
+        await h.WaitDisconnectedAsync();
+        Assert.Null(h.Store.Phone);
+        Assert.Empty(h.PairedEvents);
+    }
+
+    [Fact]
+    public async Task Session_PairingWithExpiredTokenNeverConnects()
+    {
+        using var dir = new TempDir();
+        var store = new PairingStore(dir.File("pairing.bin"), new FakeProtector());
+        var clock = new ManualClock();
+        var pairing = PairingSession.Begin(store.GetOrCreateIdentity(), "PC", clock);
+        clock.Advance(TimeSpan.FromMinutes(6));
+        var (client, server) = DuplexStream.CreatePair();
+        var sink = new ListLogSink();
+        await using var s = new PhoneSession(client, () => 0, sink,
+            new SecureLinkOptions(store.GetOrCreateIdentity(), store, null, pairing), new FakeTimeProvider());
+        var reasons = new List<string>();
+        s.Disconnected += r => { lock (reasons) reasons.Add(r); };
+        await s.RunAsync(CancellationToken.None);
+        server.Dispose();
+        Assert.Single(reasons);
+        Assert.Contains("expired", reasons[0]);
+    }
+
+    [Fact]
+    public async Task Session_FirstFrameNotInfo_Disconnects()
+    {
+        await using var h = new Harness();
+        await h.AuthenticateAsync();
+        await h.SendAsync(FrameType.Log, "I hi"u8.ToArray());
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("protocol", Assert.Single(h.Reasons));
+        Assert.Null(h.Session.Phone);
+    }
+
+    [Fact]
+    public async Task Session_UnconfirmedTimeout_Disconnects()
+    {
+        await using var h = new Harness();
+        await h.AuthenticateAsync();
+        await h.Time.WaitForTimerAsync(TimeSpan.FromSeconds(5));
+        h.Time.Advance(TimeSpan.FromSeconds(5));
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Equal(new[] { "not confirmed" }, h.Reasons);
+        Assert.Null(h.Session.Phone);
+    }
+
+    [Fact]
+    public async Task Session_HandshakeTimeout_Disconnects()
+    {
+        await using var h = new Harness();
+        h.StartRun();
+        await h.ReadRawAsync();
         await h.SendPhoneHelloAsync();
-        Assert.Equal(FrameType.Ping, (await h.ReadAsync()).Type);
-        Assert.Equal("phone", h.Session.Phone!.Role);
+        var a1 = await h.ReadRawAsync();
+        Assert.Equal(FrameType.Auth, a1.Type);
+        await h.Time.WaitForTimerAsync(TimeSpan.FromSeconds(5));
+        h.Time.Advance(TimeSpan.FromSeconds(5));
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Equal(new[] { "handshake timeout" }, h.Reasons);
+    }
+
+    [Fact]
+    public async Task Session_PlainFrameAfterAuth_Disconnects()
+    {
+        await using var h = new Harness();
+        await h.AuthenticateAsync();
+        await h.SendRawAsync(FrameType.Log, "I hi"u8.ToArray());
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("protocol", Assert.Single(h.Reasons));
+    }
+
+    [Fact]
+    public async Task Session_PairedPhoneKeyMismatch_Disconnects()
+    {
+        await using var h = new Harness(LinkMode.PairedWithOtherPhoneKey);
+        h.StartRun();
+        await h.ReadRawAsync();
+        await h.SendPhoneHelloAsync();
+        var a1 = await h.ReadRawAsync();
+        using var resp = new ResponderHandshake(h.PhoneKey, pub => true, null);
+        await h.SendRawAsync(FrameType.Auth, resp.ReadAuth1AndCreateAuth2(a1.Payload.ToArray()));
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("protocol", Assert.Single(h.Reasons));
+        Assert.Null(h.Session.Phone);
+    }
+
+    [Fact]
+    public async Task Session_TamperedSealedFrameDisconnects()
+    {
+        await using var h = new Harness();
+        await h.HandshakeAsync();
+        var sealedPayload = h.Chan!.Seal(FrameType.Log, "I fine"u8.ToArray());
+        sealedPayload[^1] ^= 0x01;
+        await h.SendRawAsync(FrameType.Sealed, sealedPayload);
+        await h.WaitDisconnectedAsync();
+        await h.Run;
+        Assert.Contains("protocol", Assert.Single(h.Reasons));
+    }
+
+    [Fact]
+    public async Task Session_RouteCommandSealed()
+    {
+        await using var h = new Harness();
+        await h.HandshakeAsync();
+        await h.Session.SendRouteAsync(true);
+        var f = await h.ReadAsync();
+        Assert.Equal(FrameType.Cmd, f.Type);
+        Assert.Equal("{\"cmd\":\"route\",\"video\":true}", Text(f));
+        await h.Session.SendRouteAsync(false);
+        Assert.Equal("{\"cmd\":\"route\",\"video\":false}", Text(await h.ReadAsync()));
+    }
+
+    [Fact]
+    public async Task Session_UnpairSendsCommandThenRemovesPhone()
+    {
+        await using var h = new Harness();
+        await h.HandshakeAsync();
+        Assert.NotNull(h.Store.Phone);
+        await h.Session.UnpairAsync();
+        var f = await h.ReadAsync();
+        Assert.Equal("{\"cmd\":\"unpair\"}", Text(f));
+        Assert.Null(h.Store.Phone);
+        Assert.NotNull(new PairingStore(h.Dir.File("pairing.bin"), new FakeProtector()).GetOrCreateIdentity());
+        Assert.Null(new PairingStore(h.Dir.File("pairing.bin"), new FakeProtector()).Phone);
     }
 
     [Fact]
@@ -156,6 +405,7 @@ public class PhoneSessionTests
     {
         await using var h = new Harness();
         await h.HandshakeAsync();
+        // Seal + write under one lock: the phone's strict counter check fails if frames hit the wire out of order.
         await Task.WhenAll(Enumerable.Range(0, 50).Select(i => Task.Run(() => h.Session.SetBitrateAsync(1000 + i))));
         var prefix = "{\"cmd\":\"bitrate\",\"kbps\":";
         var seen = new HashSet<int>();
@@ -274,8 +524,8 @@ public class PhoneSessionTests
     {
         await using var h = new Harness();
         h.StartRun();
-        await h.ReadAsync();
-        await h.SendAsync(FrameType.Log, new byte[] { 104, 105 });
+        await h.ReadRawAsync();
+        await h.SendRawAsync(FrameType.Log, new byte[] { 104, 105 });
         await h.WaitDisconnectedAsync();
         await h.Run;
         Assert.Single(h.Reasons);
@@ -288,7 +538,7 @@ public class PhoneSessionTests
     {
         await using var h = new Harness();
         h.StartRun();
-        await h.ReadAsync();
+        await h.ReadRawAsync();
         await h.Time.WaitForTimerAsync(TimeSpan.FromSeconds(5));
         h.Time.Advance(TimeSpan.FromSeconds(5));
         await h.WaitDisconnectedAsync();
@@ -310,8 +560,10 @@ public class PhoneSessionTests
         await h.Session.RequestKeyframeAsync();
         await h.Session.SetBitrateAsync(1);
         await h.Session.SetLensAsync("wide");
+        await h.Session.SendRouteAsync(true);
         Assert.Single(h.Reasons);
         h.Phone.Dispose();
+        await h.DisposeAsync();
     }
 
     [Fact]
@@ -337,5 +589,19 @@ public class PhoneSessionTests
         await h.SendAsync(FrameType.Log, Encoding.UTF8.GetBytes("W camera interrupted"));
         await h.Sink.WaitForAsync("phone", "W camera interrupted");
         Assert.Contains(h.Sink.Snapshot(), l => l.Source == "pc");
+    }
+
+    [Fact]
+    public async Task Session_NeverLogsKeyMaterial()
+    {
+        await using var h = new Harness(LinkMode.Pairing);
+        await h.HandshakeAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await h.PairedSignal.WaitAsync(cts.Token);
+        var all = string.Join("\n", h.Sink.Snapshot().Select(l => l.Line));
+        Assert.DoesNotContain(Convert.ToBase64String(h.Pairing!.Token), all);
+        Assert.DoesNotContain(Convert.ToHexString(h.Pairing.Token), all, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(Convert.ToBase64String(h.Identity.PrivateKey), all);
+        Assert.DoesNotContain("raaicam://", all);
     }
 }
