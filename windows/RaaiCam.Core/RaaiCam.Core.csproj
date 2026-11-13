@@ -8,4 +8,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="RaaiCam.Core.Tests" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RaaiCam.Protocol\RaaiCam.Protocol.csproj" />
+  </ItemGroup>
 </Project>
