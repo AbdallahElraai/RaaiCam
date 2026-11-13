@@ -93,3 +93,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## BouncyCastle.Cryptography
+
+- Source: NuGet package `BouncyCastle.Cryptography` 2.6.2 (https://github.com/bcgit/bc-csharp), referenced (not vendored) by `RaaiCam.Protocol`.
+- Used for: X25519 raw-key generation/agreement only (`Org.BouncyCastle.Math.EC.Rfc7748.X25519`); Windows CNG cannot import raw curve25519 private keys in .NET.
+- License: MIT, Copyright (c) 2000-2025 The Legion of the Bouncy Castle Inc. (https://www.bouncycastle.org)

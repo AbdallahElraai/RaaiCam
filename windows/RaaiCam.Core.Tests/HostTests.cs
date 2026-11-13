@@ -37,7 +37,7 @@ sealed class FakeLink(Observed obs) : IPhoneLink
     public event Action<Telemetry>? TelemetryReceived;
     public event Action<string>? Disconnected;
 
-    public HelloInfo? Phone { get; set; } = new(1, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
+    public HelloInfo? Phone { get; set; } = new(2, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
     public double? RttMs { get; set; } = 3.0;
     public long? OffsetUs { get; set; } = 0;
     public volatile bool Disposed;
@@ -479,7 +479,7 @@ public class HostTests
         await rig.StepAsync(20);
         Assert.Empty(link.Commands);
 
-        link.Phone = new HelloInfo(1, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
+        link.Phone = new HelloInfo(2, "phone", "RaaiCam", "1.0", "iPhone 15", "iOS 18");
         await rig.StepAsync(1);
         Assert.Equal(new[] { "start 1280x720" }, link.Commands);
     }

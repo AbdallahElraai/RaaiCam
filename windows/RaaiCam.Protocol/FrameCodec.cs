@@ -12,11 +12,13 @@ public enum FrameType : byte
     Video = 6,
     Ping = 7,
     Pong = 8,
+    Sealed = 9,
+    Info = 10,
 }
 
 public readonly record struct Frame(FrameType Type, ReadOnlyMemory<byte> Payload);
 
-public sealed class ProtocolException : Exception
+public class ProtocolException : Exception
 {
     public ProtocolException(string message) : base(message) { }
     public ProtocolException(string message, Exception inner) : base(message, inner) { }

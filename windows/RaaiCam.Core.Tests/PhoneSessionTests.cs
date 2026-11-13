@@ -74,7 +74,7 @@ sealed class Harness : IAsyncDisposable
     }
 
     public Task SendPhoneHelloAsync() =>
-        SendAsync(FrameType.Hello, Messages.Hello("phone", "1.2.3", "iPhone 15", "iOS 18"));
+        SendAsync(FrameType.Hello, Messages.Hello("phone"));
 
     /// <summary>HELLO exchange; returns the first PING frame (sent right after the exchange).</summary>
     public async Task<Frame> HandshakeAsync()
@@ -123,15 +123,12 @@ public class PhoneSessionTests
         Assert.Equal(FrameType.Hello, first.Type);
         var hello = Messages.ParseHello(first.Payload.Span);
         Assert.Equal("pc", hello.Role);
-        Assert.Equal(1, hello.Proto);
-        Assert.Equal(Environment.MachineName, hello.Device);
-        Assert.False(string.IsNullOrEmpty(hello.Version));
+        Assert.Equal(2, hello.Proto);
         Assert.Null(h.Session.Phone);
 
         await h.SendPhoneHelloAsync();
         Assert.Equal(FrameType.Ping, (await h.ReadAsync()).Type);
         Assert.Equal("phone", h.Session.Phone!.Role);
-        Assert.Equal("iPhone 15", h.Session.Phone.Device);
     }
 
     [Fact]

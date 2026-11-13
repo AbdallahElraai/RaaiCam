@@ -125,15 +125,14 @@ public class FrameCodecTests
     [Fact]
     public void Hello_RejectsWrongProto()
     {
-        var bad = Encoding.UTF8.GetBytes("{\"proto\":2,\"role\":\"phone\",\"app\":\"RaaiCam\",\"version\":\"1.0.0\",\"device\":\"x\",\"os\":\"y\"}");
+        var bad = Encoding.UTF8.GetBytes("{\"proto\":1,\"role\":\"phone\",\"app\":\"RaaiCam\",\"version\":\"1.0.0\",\"device\":\"x\",\"os\":\"y\"}");
         Assert.Throws<ProtocolException>(() => Messages.ParseHello(bad));
 
         var v = V("hello-pc");
         var hi = Messages.ParseHello(v.Payload);
-        Assert.Equal(1, hi.Proto);
+        Assert.Equal(2, hi.Proto);
         Assert.Equal("pc", hi.Role);
-        Assert.Equal("Windows 11", hi.Os);
-        Assert.True(v.Payload.AsSpan().SequenceEqual(Messages.Hello("pc", "1.0.0", "DESKTOP-RAAI", "Windows 11")));
+        Assert.True(v.Payload.AsSpan().SequenceEqual(Messages.Hello("pc")));
     }
 
     [Fact]

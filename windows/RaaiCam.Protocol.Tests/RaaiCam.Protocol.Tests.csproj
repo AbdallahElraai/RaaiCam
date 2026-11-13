@@ -14,5 +14,6 @@
   <ItemGroup>
     <ProjectReference Include="..\RaaiCam.Protocol\RaaiCam.Protocol.csproj" />
     <Content Include="..\..\protocol\test-vectors.json" Link="test-vectors.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\protocol\test-vectors-v2.json" Link="test-vectors-v2.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

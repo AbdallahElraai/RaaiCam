@@ -4,7 +4,7 @@ using System.Text.Json.Serialization;
 
 namespace RaaiCam.Protocol;
 
-public sealed record HelloInfo(int Proto, string Role, string App, string Version, string Device, string Os);
+public sealed record HelloInfo(int Proto, string Role, string App = "", string Version = "", string Device = "", string Os = "");
 
 public sealed record StartCmd(int Width, int Height, int Fps, string Lens, int BitrateKbps)
 {
@@ -39,7 +39,7 @@ public sealed record VideoFrame(ulong CaptureUs, uint Seq, bool Keyframe, ReadOn
 
 public static class Messages
 {
-    public const int ProtoVersion = 1;
+    public const int ProtoVersion = 2;
     const int VideoHeaderSize = 13;
 
     static readonly JsonSerializerOptions Json = new()
@@ -48,10 +48,10 @@ public static class Messages
         PropertyNameCaseInsensitive = true,
     };
 
-    sealed record HelloWire(int Proto, string Role, string App, string Version, string Device, string Os);
+    sealed record HelloWire(int Proto, string Role);
 
-    public static byte[] Hello(string role, string version, string device, string os) =>
-        JsonSerializer.SerializeToUtf8Bytes(new HelloWire(ProtoVersion, role, "RaaiCam", version, device, os), Json);
+    public static byte[] Hello(string role) =>
+        JsonSerializer.SerializeToUtf8Bytes(new HelloWire(ProtoVersion, role), Json);
 
     public static HelloInfo ParseHello(ReadOnlySpan<byte> payload)
     {
@@ -60,7 +60,7 @@ public static class Messages
         catch (JsonException e) { throw new ProtocolException("invalid HELLO json", e); }
         if (h is null) throw new ProtocolException("empty HELLO");
         if (h.Proto != ProtoVersion) throw new ProtocolException($"unsupported proto {h.Proto}");
-        return new HelloInfo(h.Proto, h.Role ?? "", h.App ?? "", h.Version ?? "", h.Device ?? "", h.Os ?? "");
+        return new HelloInfo(h.Proto, h.Role ?? "");
     }
 
     public static byte[] Cmd(object cmd) => JsonSerializer.SerializeToUtf8Bytes(cmd, cmd.GetType(), Json);

@@ -56,8 +56,7 @@ public sealed class PhoneSession : IAsyncDisposable
         try
         {
             PcLog("session started");
-            await WriteFrameAsync(FrameType.Hello, Messages.Hello("pc", AppVersion(), Environment.MachineName,
-                Environment.OSVersion.VersionString), token).ConfigureAwait(false);
+            await WriteFrameAsync(FrameType.Hello, Messages.Hello("pc"), token).ConfigureAwait(false);
 
             Frame? first;
             using (var helloCts = new CancellationTokenSource(HelloTimeout, _time))
@@ -75,7 +74,7 @@ public sealed class PhoneSession : IAsyncDisposable
                 throw new ProtocolException($"expected HELLO first, got {first.Value.Type}");
             var phone = Messages.ParseHello(first.Value.Payload.Span);
             _phone = phone;
-            PcLog($"phone hello: {phone.App} {phone.Version} on {phone.Device} ({phone.Os})");
+            PcLog($"phone hello: proto {phone.Proto}");
 
             pingLoop = PingLoopAsync(token);
 
@@ -181,9 +180,6 @@ public sealed class PhoneSession : IAsyncDisposable
         PcLog("disconnected: " + reason);
         Raise(Disconnected, reason);
     }
-
-    static string AppVersion() =>
-        typeof(PhoneSession).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
 
     // ---- writes ----
 

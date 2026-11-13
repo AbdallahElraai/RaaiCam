@@ -1,0 +1,37 @@
+{
+  "note": "TEST-ONLY KEYS. These private keys are fixed, public and worthless: never use them for a real pairing. Shared by the C# and Swift tests. Handshake: PROTOCOL.md 'Protocol v2'. All values lowercase hex.",
+  "keys": {
+    "sIPriv": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "sIPub": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+    "eIPriv": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "eIPub": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254",
+    "sRPriv": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "sRPub": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a",
+    "eRPriv": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+    "eRPub": "675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f",
+    "pcId": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "token": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+  },
+  "pairedMode": {
+    "auth1": "01358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd1662548f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "auth2": "675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52fbf9cf24891bbd0230930bf75d87f25308b4cc311b47eef0167fdc813a6cec34e8dddd5f5f22d84943daec8c94a415995",
+    "auth3": "d618ca8cbd9676020f1b92f414012ada033e",
+    "kI2R": "94e0e00273e6633010a5550b709044885054ff816c423bb430049f37fcc93283",
+    "kR2I": "37563eebb05fdd67e69f6556fe61ac6e434f3ac24a95163644f1dd784052dc9c"
+  },
+  "pairingMode": {
+    "auth1": "02358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd1662548f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf47e9dd9c716620c83e091fb0063e626e",
+    "auth2": "675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52fb38fd366396ca1c4a9ca54f32b483df54da91b6064733776ce4ce1a8374fc4d134dceb61df5b694c8ef17a7ef7e03c2c",
+    "auth3": "89048c1692bed84aa181cc5d79ab9cd6b4f0",
+    "kI2R": "95e91d674f7c2db75ef5caa9ca714f3803e83c3a1bc937986c9e12eab8e58189",
+    "kR2I": "eb0701457e4479bd0a8977032978bf49caf9b9b974662225c1bda468f5e665fa"
+  },
+  "sealed": {
+    "comment": "paired-mode keys; initiator to responder; counter 0; inner frame = CMD {\"cmd\":\"stop\"}",
+    "innerType": 3,
+    "innerPayloadUtf8": "{\"cmd\":\"stop\"}",
+    "counter": 0,
+    "payloadHex": "000000000000000072c473ef706047f720cc836a8a61c0e799fb8d22bd4548cb9d89efea5eb232d43c1cbe",
+    "frameHex": "090000002b000000000000000072c473ef706047f720cc836a8a61c0e799fb8d22bd4548cb9d89efea5eb232d43c1cbe"
+  }
+}
