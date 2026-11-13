@@ -8,8 +8,12 @@ namespace RaaiCam.Protocol.Crypto;
 /// Plaintext = inner v1 frame [u8 type][u32 BE len][payload]. Nonce = [u32 BE direction][u64 BE counter]
 /// (1 = initiator-to-responder, 2 = responder-to-initiator); AAD = [0x09][u64 BE counter]. The receiver requires
 /// counter == expected; any failure closes the channel for good.
+/// Writer rule: <see cref="Seal"/> and the socket write of its result must happen under ONE writer lock, so frames reach
+/// the wire in counter order (the receiver requires strictly sequential counters).
+/// Key confirmation: the responder MUST send a SEALED INFO frame first; <see cref="IsConfirmed"/> turns true on the first
+/// successful Open, and only then has the peer proven it holds the session keys.
 /// </summary>
-public sealed class SealedChannel
+public sealed class SealedChannel : IDisposable
 {
     const int CounterSize = 8;
     const int InnerHeader = 5;
@@ -19,11 +23,19 @@ public sealed class SealedChannel
     readonly object _sendLock = new(), _recvLock = new();
     ulong _sendCounter, _recvCounter;
     volatile bool _closed;
+    volatile bool _confirmed;
 
-    public SealedChannel(SessionKeys keys, bool isInitiator)
+    /// <summary>True after the first successful Open (key confirmation).</summary>
+    public bool IsConfirmed => _confirmed;
+
+    public SealedChannel(SessionKeys keys, bool isInitiator) : this(keys, isInitiator, 0, 0) { }
+
+    // Test hook: start counters (vectors with a high counter).
+    internal SealedChannel(SessionKeys keys, bool isInitiator, ulong sendStart, ulong recvStart)
     {
-        _sendKey = isInitiator ? keys.InitiatorToResponder : keys.ResponderToInitiator;
-        _recvKey = isInitiator ? keys.ResponderToInitiator : keys.InitiatorToResponder;
+        _sendCounter = sendStart; _recvCounter = recvStart;
+        _sendKey = (byte[])(isInitiator ? keys.InitiatorToResponder : keys.ResponderToInitiator).Clone();
+        _recvKey = (byte[])(isInitiator ? keys.ResponderToInitiator : keys.InitiatorToResponder).Clone();
         _sendDir = isInitiator ? 1u : 2u;
         _recvDir = isInitiator ? 2u : 1u;
     }
@@ -40,7 +52,16 @@ public sealed class SealedChannel
         BinaryPrimitives.WriteUInt64BigEndian(a[1..], counter);
     }
 
-    static bool InnerTypeAllowed(FrameType t) => t is not (FrameType.Hello or FrameType.Auth or FrameType.Sealed);
+    static bool InnerTypeAllowed(FrameType t) => t is FrameType.Cmd or FrameType.Telemetry or FrameType.Log or FrameType.Video
+        or FrameType.Ping or FrameType.Pong or FrameType.Info;
+
+    /// <summary>Best-effort erasure of this channel keys (managed memory); the channel is closed afterwards.</summary>
+    public void Dispose()
+    {
+        _closed = true;
+        CryptographicOperations.ZeroMemory(_sendKey);
+        CryptographicOperations.ZeroMemory(_recvKey);
+    }
 
     /// <summary>Returns the SEALED frame payload for an inner frame.</summary>
     public byte[] Seal(FrameType innerType, ReadOnlySpan<byte> innerPayload)
@@ -100,6 +121,7 @@ public sealed class SealedChannel
                 uint len = BinaryPrimitives.ReadUInt32BigEndian(plain.AsSpan(1));
                 if (!InnerTypeAllowed(type) || len != (uint)(n - InnerHeader)) throw new CryptoProtocolException();
                 _recvCounter++;
+                _confirmed = true;
                 return new Frame(type, plain.AsMemory(InnerHeader));
             }
             catch { _closed = true; throw; }

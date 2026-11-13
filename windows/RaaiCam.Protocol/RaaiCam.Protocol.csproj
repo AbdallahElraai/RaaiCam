@@ -6,7 +6,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
-    <!-- X25519 raw-key operations (MIT). Pinned exact; see protocol/PROTOCOL.md "X25519 on Windows". -->
+    <!-- X25519 raw-key operations (MIT). Pinned exact; see protocol/PROTOCOL.md "Security notes" (X25519 implementation). -->
     <PackageReference Include="BouncyCastle.Cryptography" Version="[2.6.2]" />
     <InternalsVisibleTo Include="RaaiCam.Protocol.Tests" />
   </ItemGroup>

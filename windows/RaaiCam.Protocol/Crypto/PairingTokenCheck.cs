@@ -22,6 +22,7 @@ public sealed class PairingTokenCheck
     readonly object _gate = new();
     bool _used;
     bool _inFlight;
+    bool _consuming;
 
     public PairingTokenCheck(byte[] token, DateTimeOffset expiresAt, byte[] expectedPcPub, Func<bool> markUsed,
         TimeProvider? time = null)
@@ -66,11 +67,23 @@ public sealed class PairingTokenCheck
     {
         lock (_gate)
         {
-            if (_used || !_inFlight) return false;
-            if (!_markUsed()) return false;
-            _used = true;
-            _inFlight = false;
-            return true;
+            if (_used || !_inFlight || _consuming) return false;
+            if (_time.GetUtcNow() >= _expiresAt) return false; // re-check expiry at consume time
+            _consuming = true;
         }
+        bool ok = false;
+        try { ok = _markUsed(); } // owner callback runs outside the lock (it may persist or call back)
+        finally
+        {
+            lock (_gate)
+            {
+                _consuming = false;
+                if (ok) { _used = true; _inFlight = false; }
+            }
+        }
+        return ok;
     }
+
+    /// <summary>The token, used as a PSK in mode 2 key derivation.</summary>
+    internal byte[] Token => _token;
 }

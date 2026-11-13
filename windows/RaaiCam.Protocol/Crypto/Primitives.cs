@@ -43,17 +43,19 @@ public static class X25519
 }
 
 /// <summary>An X25519 key pair (static or ephemeral).</summary>
-public sealed class StaticKey
+public sealed class StaticKey : IDisposable
 {
     public byte[] Private { get; }
     public byte[] Public { get; }
     StaticKey(byte[] priv, byte[] pub) { Private = priv; Public = pub; }
+    /// <summary>Best-effort erasure of the private key (managed memory).</summary>
+    public void Dispose() => CryptographicOperations.ZeroMemory(Private);
     public static StaticKey Generate() { var (a, b) = X25519.Generate(); return new StaticKey(a, b); }
     public static StaticKey FromPrivate(byte[] priv) { var (a, b) = X25519.FromPrivate(priv); return new StaticKey(a, b); }
 }
 
 /// <summary>Per-direction AES-256-GCM keys for one connection.</summary>
-public sealed class SessionKeys
+public sealed class SessionKeys : IDisposable
 {
     public byte[] InitiatorToResponder { get; }
     public byte[] ResponderToInitiator { get; }
@@ -63,5 +65,12 @@ public sealed class SessionKeys
         if (i2r is null || r2i is null || i2r.Length != 32 || r2i.Length != 32) throw new CryptoProtocolException("bad key");
         InitiatorToResponder = i2r;
         ResponderToInitiator = r2i;
+    }
+
+    /// <summary>Best-effort erasure (managed memory).</summary>
+    public void Dispose()
+    {
+        CryptographicOperations.ZeroMemory(InitiatorToResponder);
+        CryptographicOperations.ZeroMemory(ResponderToInitiator);
     }
 }
