@@ -53,6 +53,14 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(AppModel.advisory(for: streaming, telemetry: tele(battery: 0, charging: false), cameraAuthorized: true))
     }
 
+    func testPairingScreenWhenUnpaired() {
+        XCTAssertEqual(AppModel.screen(for: .waiting, telemetry: tele(), cameraAuthorized: true, pairingActive: true), .pairing)
+        // camera permission still wins (the scanner needs it)
+        XCTAssertEqual(AppModel.screen(for: .waiting, telemetry: tele(), cameraAuthorized: false, pairingActive: true),
+                       .warning(.cameraPermission))
+        XCTAssertEqual(AppModel.screen(for: .waiting, telemetry: tele(), cameraAuthorized: true, pairingActive: false), .ready)
+    }
+
     func testPermissionDeniedWarning() {
         XCTAssertEqual(AppModel.screen(for: .waiting, telemetry: tele(), cameraAuthorized: false), .warning(.cameraPermission))
         XCTAssertEqual(AppModel.screen(for: .error("x"), telemetry: tele(thermal: "serious"), cameraAuthorized: false),

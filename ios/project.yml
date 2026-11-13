@@ -23,6 +23,8 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         NSCameraUsageDescription: "RaaiCam uses the camera to stream video to your PC."
         NSLocalNetworkUsageDescription: "RaaiCam connects to your PC to stream video."
+        NSBonjourServices:
+          - _raaicam._tcp
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.raaicam.app
@@ -36,6 +38,8 @@ targets:
     sources:
       - path: Tests
       - path: ../protocol/test-vectors.json
+        buildPhase: resources
+      - path: ../protocol/test-vectors-v2.json
         buildPhase: resources
     dependencies:
       - target: RaaiCam

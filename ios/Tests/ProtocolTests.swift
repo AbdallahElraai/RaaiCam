@@ -90,6 +90,10 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try Command.parse(Data(#"{"cmd":"keyframe"}"#.utf8)), .keyframe)
         XCTAssertEqual(try Command.parse(Data(#"{"cmd":"bitrate","kbps":6000}"#.utf8)), .bitrate(kbps: 6000))
         XCTAssertEqual(try Command.parse(Data(#"{"cmd":"lens","lens":"ultra"}"#.utf8)), .lens(.ultra))
+        XCTAssertEqual(try Command.parse(Data(#"{"cmd":"route","video":true}"#.utf8)), .route(video: true))
+        XCTAssertEqual(try Command.parse(Data(#"{"cmd":"route","video":false}"#.utf8)), .route(video: false))
+        XCTAssertEqual(try Command.parse(Data(#"{"cmd":"unpair"}"#.utf8)), .unpair)
+        XCTAssertThrowsError(try Command.parse(Data(#"{"cmd":"route"}"#.utf8)))
         XCTAssertEqual(try Command.parse(Data(#"{"cmd":"dance"}"#.utf8)), .unknown("dance"))
         XCTAssertThrowsError(try Command.parse(Data("not json".utf8)))
     }
@@ -107,6 +111,9 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(obj["width"] as? Int, 1920)
         XCTAssertEqual(obj["streaming"] as? Bool, true)
         XCTAssertEqual(obj["lens"] as? String, "ultra")
+        XCTAssertEqual(obj["link"] as? String, "usb")
+        let wifi = try JSONSerialization.jsonObject(with: t.jsonData(link: .wifi)) as! [String: Any]
+        XCTAssertEqual(wifi["link"] as? String, "wifi")
         for key in ["battery", "charging", "height", "fpsCapture", "fpsEncode", "bitrateKbps", "paused"] {
             XCTAssertNotNil(obj[key], key)
         }
@@ -130,9 +137,11 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testHelloRoundTrip() throws {
-        let data = Hello.phone(version: "1.0.0", device: "iPhone15,2", os: "iOS 17.5")
+        let data = Hello.phone()
+        let vector = try XCTUnwrap(loadVectors().first { $0.name == "hello-phone" })
+        XCTAssertEqual(data, vector.payload)
         let parsed = try Hello.parse(data)
-        XCTAssertEqual(parsed.proto, 1)
+        XCTAssertEqual(parsed.proto, 2)
         XCTAssertEqual(parsed.role, "phone")
         XCTAssertThrowsError(try Hello.parse(Data("{}".utf8)))
     }

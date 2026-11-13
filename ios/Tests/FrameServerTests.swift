@@ -29,7 +29,13 @@ final class TestClient {
         data.withUnsafeBytes { raw in _ = Darwin.write(fd, raw.baseAddress, raw.count) }
     }
 
-    /// Reads until `count` frames have arrived (or the 3 s receive timeout / EOF hits).
+    func setTimeout(_ seconds: TimeInterval) {
+        let whole = Int(seconds)
+        var tv = timeval(tv_sec: whole, tv_usec: Int32((seconds - Double(whole)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
+    /// Reads until `count` frames have arrived (or the receive timeout / EOF hits).
     func readFrames(count: Int) -> [Frame] {
         var got = [Frame]()
         var buf = [UInt8](repeating: 0, count: 4096)
@@ -53,9 +59,11 @@ final class EventLog {
 
 final class FrameServerTests: XCTestCase {
     private var server: FrameServer!
+    private var fixture: Fixture!
 
     override func setUpWithError() throws {
-        server = FrameServer(port: 0)
+        fixture = try Fixture(paired: true)
+        server = FrameServer(port: 0, authority: fixture.store)
     }
 
     private func startServer() throws -> UInt16 {
@@ -73,10 +81,6 @@ final class FrameServerTests: XCTestCase {
     }
 
     func testClientReceivesHello() throws {
-        let srv: FrameServer = server
-        server.onClientConnected = { _ in
-            srv.send(.hello, Hello.phone(version: "1.0.0", device: "test", os: "iOS test"))
-        }
         let port = try startServer()
         let client = try XCTUnwrap(TestClient(port: port))
         defer { client.close() }
@@ -84,51 +88,56 @@ final class FrameServerTests: XCTestCase {
         XCTAssertEqual(frames.count, 1)
         XCTAssertEqual(frames.first?.type, FrameType.hello.rawValue)
         let hello = try Hello.parse(try XCTUnwrap(frames.first).payload)
-        XCTAssertEqual(hello.proto, 1)
+        XCTAssertEqual(hello.proto, 2)
         XCTAssertEqual(hello.role, "phone")
+    }
+
+    func testFirstSealedFrameIsInfo() throws {
+        server.infoPayload = Data(#"{"app":"RaaiCam","version":"1.0.0","device":"test","os":"iOS test"}"#.utf8)
+        let port = try startServer()
+        let client = try AuthedClient.connect(port: port, initiator: fixture.initiator()) // asserts INFO first
+        defer { client.close() }
     }
 
     func testPartialWritesReassembleAndPingGetsPong() throws {
         let received = EventLog()
-        server.onFrame = { frame in received.add("type\(frame.type)") }
+        server.onFrame = { _, _, frame in received.add("type\(frame.type)") }
         let port = try startServer()
-        let client = try XCTUnwrap(TestClient(port: port))
+        let client = try AuthedClient.connect(port: port, initiator: fixture.initiator())
         defer { client.close() }
 
         // PING (answered by the server itself) dribbled in one byte at a time
-        let ping = FrameCodec.encode(.ping, Data([0, 0, 0, 0, 0, 0x0f, 0x42, 0x40]))
-        for b in ping { client.send(Data([b])); Thread.sleep(forTimeInterval: 0.002) }
-        let pong = client.readFrames(count: 1)
+        try client.sendInner(.ping, Data([0, 0, 0, 0, 0, 0x0f, 0x42, 0x40]), dribble: true)
+        let pong = client.readInner(count: 1)
         XCTAssertEqual(pong.first?.type, FrameType.pong.rawValue)
         XCTAssertEqual(pong.first?.payload.count, 16)
         XCTAssertEqual(pong.first?.payload.readBE64(at: 0), 1_000_000)
 
         // CMD (forwarded to onFrame) also dribbled
-        let cmd = FrameCodec.encode(.cmd, Data(#"{"cmd":"stop"}"#.utf8))
-        for b in cmd { client.send(Data([b])); Thread.sleep(forTimeInterval: 0.002) }
+        try client.sendInner(.cmd, Data(#"{"cmd":"stop"}"#.utf8), dribble: true)
         try waitUntil("cmd frame") { received.all.count == 1 }
         XCTAssertEqual(received.all, ["type3"])
     }
 
     func testClientReplacementDoesNotSkewPendingCount() throws {
         let events = EventLog()
-        server.onClientConnected = { gen in events.add("c\(gen)") }
-        server.onClientDisconnected = { gen in events.add("d\(gen)") }
+        server.onSessionStarted = { gen, _ in events.add("c\(gen)") }
+        server.onSessionEnded = { gen, _ in events.add("d\(gen)") }
         let port = try startServer()
-        let a = try XCTUnwrap(TestClient(port: port))
+        let a = try AuthedClient.connect(port: port, initiator: fixture.initiator())
         defer { a.close() }
         try waitUntil("A connected") { events.all.contains("c1") }
 
         // queue video on A and replace it immediately: stale completions must not decrement B's counter
         for _ in 0..<3 { server.sendVideo(Data(repeating: 7, count: 200_000)) }
-        let b = try XCTUnwrap(TestClient(port: port))
+        let b = try AuthedClient.connect(port: port, initiator: fixture.initiator())
         defer { b.close() }
         try waitUntil("B connected") { events.all.contains("c2") }
         Thread.sleep(forTimeInterval: 0.3)
         XCTAssertEqual(server.pendingVideoCount, 0)
 
         for _ in 0..<2 { server.sendVideo(Data(repeating: 1, count: 100)) }
-        let frames = b.readFrames(count: 2)
+        let frames = b.readInner(count: 2)
         XCTAssertEqual(frames.count, 2)
         try waitUntil("drain") { self.server.pendingVideoCount == 0 }
         XCTAssertGreaterThanOrEqual(server.pendingVideoCount, 0)
@@ -136,14 +145,14 @@ final class FrameServerTests: XCTestCase {
 
     func testStaleDisconnectOrdering() throws {
         let events = EventLog()
-        server.onClientConnected = { gen in events.add("c\(gen)") }
-        server.onClientDisconnected = { gen in events.add("d\(gen)") }
+        server.onSessionStarted = { gen, _ in events.add("c\(gen)") }
+        server.onSessionEnded = { gen, _ in events.add("d\(gen)") }
         let port = try startServer()
-        let a = try XCTUnwrap(TestClient(port: port))
+        let a = try AuthedClient.connect(port: port, initiator: fixture.initiator())
         try waitUntil("A connected") { events.all == ["c1"] }
-        let b = try XCTUnwrap(TestClient(port: port))
+        let b = try AuthedClient.connect(port: port, initiator: fixture.initiator())
         defer { b.close() }
-        // replacement reports exactly: old disconnected, then new connected
+        // replacement (only after B authenticated) reports exactly: old disconnected, then new connected
         try waitUntil("B connected") { events.all == ["c1", "d1", "c2"] }
         a.close()
         Thread.sleep(forTimeInterval: 0.4)
