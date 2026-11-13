@@ -6,7 +6,8 @@ namespace RaaiCam.Core.Discovery;
 
 /// <summary>
 /// Tiny JSON settings file (<c>%APPDATA%\RaaiCam\settings.json</c>). Unknown keys are preserved. An unreadable or
-/// corrupt file reads as empty; writes are atomic (temp file + replace). Thread-safe.
+/// corrupt file reads as empty; an unreadable one (IO error) reads as "no value" and is never overwritten (writes throw
+/// <see cref="IOException"/>). Writes are atomic (temp file + replace). Thread-safe.
 /// </summary>
 public sealed class SettingsStore
 {
@@ -27,7 +28,10 @@ public sealed class SettingsStore
         {
             lock (_gate)
             {
-                var s = ReadRoot()[LastPhoneIpKey] is JsonValue v && v.TryGetValue<string>(out var str) ? str : null;
+                JsonObject root;
+                try { root = ReadRoot(); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+                var s = root[LastPhoneIpKey] is JsonValue v && v.TryGetValue<string>(out var str) ? str : null;
                 return s is not null && IPAddress.TryParse(s, out var ip) ? ip : null;
             }
         }
@@ -43,6 +47,7 @@ public sealed class SettingsStore
         }
     }
 
+    /// <summary>Corrupt content reads as empty; IO errors propagate so a file we could not read is never overwritten.</summary>
     JsonObject ReadRoot()
     {
         try
@@ -50,7 +55,7 @@ public sealed class SettingsStore
             if (!File.Exists(_path)) return new JsonObject();
             return JsonNode.Parse(File.ReadAllBytes(_path)) as JsonObject ?? new JsonObject();
         }
-        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+        catch (JsonException)
         {
             return new JsonObject();
         }

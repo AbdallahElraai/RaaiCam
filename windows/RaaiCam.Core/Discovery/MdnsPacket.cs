@@ -14,7 +14,8 @@ public sealed record MdnsRecord(
     string? Target = null,
     int Port = 0,
     IPAddress? Address = null,
-    IReadOnlyDictionary<string, string>? Txt = null);
+    IReadOnlyDictionary<string, string>? Txt = null,
+    uint Ttl = 0);
 
 /// <summary>
 /// Minimal DNS wire-format reader/writer for mDNS. The parser treats every packet as hostile: all reads are bounds
@@ -28,7 +29,7 @@ public static class MdnsPacket
     const int MaxJumps = 16;
     const int MaxTxtEntries = 16;
 
-    /// <summary>Builds a query with the unicast-response (QU) bit set on every question.</summary>
+    /// <summary>Builds a query with the QU bit set on every question. Our queries come from an ephemeral port (not 5353), so responders treat them as legacy unicast queries and answer to that port regardless; the bit is a harmless hint.</summary>
     public static byte[] BuildQuery(IEnumerable<MdnsQuestion> questions)
     {
         var qs = questions.ToList();
@@ -76,6 +77,7 @@ public static class MdnsPacket
                 var type = (MdnsRecordType)U16(p, pos);
                 int cls = U16(p, pos + 2) & 0x7FFF;
                 int rdlen = U16(p, pos + 8);
+                uint ttl = ((uint)U16(p, pos + 4) << 16) | (uint)U16(p, pos + 6);
                 int start = pos + 10;
                 if (start + rdlen > p.Length) break;
                 pos = start + rdlen;
@@ -85,13 +87,13 @@ public static class MdnsPacket
                 switch (type)
                 {
                     case MdnsRecordType.A:
-                        if (rdlen == 4) result.Add(new MdnsRecord(name, type, Address: new IPAddress(rd)));
+                        if (rdlen == 4) result.Add(new MdnsRecord(name, type, Address: new IPAddress(rd), Ttl: ttl));
                         break;
                     case MdnsRecordType.Ptr:
                     {
                         int q = start;
                         if (ReadName(p, ref q, out var target) && q <= start + rdlen)
-                            result.Add(new MdnsRecord(name, type, Target: target));
+                            result.Add(new MdnsRecord(name, type, Target: target, Ttl: ttl));
                         break;
                     }
                     case MdnsRecordType.Srv:
@@ -100,11 +102,11 @@ public static class MdnsPacket
                         int port = U16(p, start + 4);
                         int q = start + 6;
                         if (ReadName(p, ref q, out var target) && q <= start + rdlen)
-                            result.Add(new MdnsRecord(name, type, Target: target, Port: port));
+                            result.Add(new MdnsRecord(name, type, Target: target, Port: port, Ttl: ttl));
                         break;
                     }
                     case MdnsRecordType.Txt:
-                        result.Add(new MdnsRecord(name, type, Txt: ParseTxt(rd)));
+                        result.Add(new MdnsRecord(name, type, Txt: ParseTxt(rd), Ttl: ttl));
                         break;
                 }
             }

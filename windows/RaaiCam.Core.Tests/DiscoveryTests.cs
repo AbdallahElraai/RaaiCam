@@ -13,6 +13,11 @@ sealed class DnsBuilder
     readonly Dictionary<string, int> _names = new(StringComparer.OrdinalIgnoreCase);
     int _count;
     readonly bool _compress;
+    public uint Ttl { get; set; } = 3600;
+    public int Cls { get; set; } = 0x8001;
+    public DnsBuilder Raw(string name, int type, byte[] rdata) => Rec(name, type, () => _b.AddRange(rdata));
+    /// <summary>A PTR whose target instance label is the given raw bytes (for invalid UTF-8).</summary>
+    public DnsBuilder PtrRawLabel(string name, byte[] label) => Rec(name, 12, () => { _b.Add((byte)label.Length); _b.AddRange(label); Name("_raaicam._tcp.local"); });
 
     public DnsBuilder(bool compress = true, ushort flags = 0x8400)
     {
@@ -43,7 +48,7 @@ sealed class DnsBuilder
 
     DnsBuilder Rec(string name, int type, Action rdata)
     {
-        Name(name); U16(type); U16(0x8001); _b.AddRange(new byte[] { 0, 0, 0x0E, 0x10 });
+        Name(name); U16(type); U16(Cls); _b.AddRange(new[] { (byte)(Ttl >> 24), (byte)(Ttl >> 16), (byte)(Ttl >> 8), (byte)Ttl });
         var lenAt = _b.Count; U16(0);
         var start = _b.Count; rdata();
         var len = _b.Count - start; _b[lenAt] = (byte)(len >> 8); _b[lenAt + 1] = (byte)len;
@@ -386,6 +391,208 @@ public class DiscoveryTests
         var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(Path.GetTempPath(), "x-" + Guid.NewGuid().ToString("N") + ".json")), null, new FakeTimeProvider());
         await d.DisposeAsync();
         Assert.True(t.Disposed);
+    }
+
+    // ---- hardening round ----
+
+    static byte[] Answer(string inst, string id, string host, string ip, uint ttl = 3600) =>
+        new DnsBuilder { Ttl = ttl }
+            .Ptr(Svc, inst).Srv(inst, 47820, host).Txt(inst, "v=2", "id=" + id).A(host, ip).Build();
+
+    static string InstName(string id) => "RaaiCam-" + id + "._raaicam._tcp.local";
+
+    static async Task<DiscoveredPhone> Next(IAsyncEnumerator<DiscoveredPhone> e)
+    {
+        var t = e.MoveNextAsync().AsTask();
+        Assert.True(await t.WaitAsync(TimeSpan.FromSeconds(10)));
+        return e.Current;
+    }
+
+    [Fact]
+    public void Discovery_ParserHandlesBadRdataLengthsAndClassBits()
+    {
+        Assert.Empty(MdnsPacket.Parse(new DnsBuilder().Raw("a.local", 1, new byte[] { 1, 2, 3 }).Build()));
+        Assert.Empty(MdnsPacket.Parse(new DnsBuilder().Raw("a.local", 1, new byte[] { 1, 2, 3, 4, 5 }).Build()));
+        Assert.Empty(MdnsPacket.Parse(new DnsBuilder().Raw("a.local", 33, new byte[] { 0, 0, 0, 0, 1, 2 }).Build()));
+        var txt = MdnsPacket.Parse(new DnsBuilder().Raw("a.local", 16, new byte[] { 200, (byte)'a', (byte)'b' }).Build());
+        Assert.Empty(Assert.Single(txt).Txt!); // length overrun: nothing read, nothing thrown
+
+        // cache-flush bit is masked off; other classes are ignored; TTL is read
+        var flush = MdnsPacket.Parse(new DnsBuilder { Cls = 0x8001, Ttl = 77 }.A("a.local", "10.0.0.1").Build());
+        Assert.Equal(77u, Assert.Single(flush).Ttl);
+        Assert.Single(MdnsPacket.Parse(new DnsBuilder { Cls = 0x0001 }.A("a.local", "10.0.0.1").Build()));
+        Assert.Empty(MdnsPacket.Parse(new DnsBuilder { Cls = 0x0003 }.A("a.local", "10.0.0.1").Build()));
+    }
+
+    [Fact]
+    public async Task Discovery_InvalidUtf8Instance_DoesNotStopQueries()
+    {
+        var t = new FakeMdnsTransport();
+        var time = new FakeTimeProvider();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, time);
+            await using var e = d.BrowseAsync().GetAsyncEnumerator();
+            var first = e.MoveNextAsync().AsTask();
+            await t.SentSignal.WaitAsync(TimeSpan.FromSeconds(10));
+            t.Deliver(new DnsBuilder().PtrRawLabel(Svc, Enumerable.Repeat((byte)0xFF, 40).ToArray()).Build());
+            t.Deliver(FullAnswer());
+            Assert.True(await first.WaitAsync(TimeSpan.FromSeconds(10)));
+
+            await time.WaitForTimerAsync(TimeSpan.FromSeconds(1));
+            time.Advance(TimeSpan.FromSeconds(1));
+            await t.SentSignal.WaitAsync(TimeSpan.FromSeconds(10));          // the next query is still sent
+            lock (t.Sent) Assert.Equal(1, t.Sent[1][5]);                     // and carries only the PTR question
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("a1b2c3d4")]
+    public async Task Discovery_JunkCannotFillSlots(string? expected)
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), expected, new FakeTimeProvider());
+            for (int i = 0; i < 100; i++)
+            {
+                t.Deliver(new DnsBuilder().Ptr(Svc, $"Junk{i}._raaicam._tcp.local").Build());
+                t.Deliver(new DnsBuilder().A($"junk{i}.local", "192.168.5.5").Build());
+            }
+            t.Deliver(FullAnswer(ip: "192.168.1.50"));
+            var got = await Take(d.BrowseAsync(), 1);
+            Assert.Equal("192.168.1.50", got[0].Address.ToString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_GoodbyeRemovesInstance()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, new FakeTimeProvider());
+            await using var e = d.BrowseAsync().GetAsyncEnumerator();
+            t.Deliver(FullAnswer(ip: "192.168.1.50"));
+            Assert.Equal("192.168.1.50", (await Next(e)).Address.ToString());
+
+            t.Deliver(new DnsBuilder { Ttl = 0 }.Ptr(Svc, Inst).Srv(Inst, 47820, "phone.local").Txt(Inst, "v=2", "id=a1b2c3d4").Build());
+            t.Deliver(new DnsBuilder().A("phone.local", "192.168.1.55").Build());   // nothing refers to it any more
+            t.Deliver(FullAnswer(ip: "192.168.1.56", host: "h2.local"));
+            Assert.Equal("192.168.1.56", (await Next(e)).Address.ToString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_EntriesExpireAfterTtl()
+    {
+        var t = new FakeMdnsTransport();
+        var time = new FakeTimeProvider();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, time);
+            await using var e = d.BrowseAsync().GetAsyncEnumerator();
+            t.Deliver(new DnsBuilder { Ttl = 5 }.Ptr(Svc, InstName("22222222")).Srv(InstName("22222222"), 47820, "exp.local")
+                .Txt(InstName("22222222"), "v=2", "id=22222222").Build());
+            t.Deliver(Answer(InstName("11111111"), "11111111", "m1.local", "192.168.1.90"));
+            Assert.Equal("11111111", (await Next(e)).IdHash);   // first packet is certainly applied now
+
+            time.Advance(TimeSpan.FromSeconds(10));
+            t.Deliver(new DnsBuilder().A("exp.local", "192.168.1.91").Build());   // would have completed the expired instance
+            t.Deliver(Answer(InstName("33333333"), "33333333", "m3.local", "192.168.1.92"));
+            var next = await Next(e);
+            Assert.Equal("33333333", next.IdHash);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_PublicAddressesAreIgnored()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, new FakeTimeProvider());
+            t.Deliver(FullAnswer(ip: "8.8.8.8", host: "pub.local"));
+            t.Deliver(FullAnswer(ip: "192.168.1.60", host: "lan.local"));
+            var got = await Take(d.BrowseAsync(), 1);
+            Assert.Equal("192.168.1.60", got[0].Address.ToString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_LastKnownIsDeduplicatedAgainstMdnsWithoutFilter()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            var s = new SettingsStore(Path.Combine(dir, "s.json"));
+            s.SetLastPhoneIp(IPAddress.Parse("192.168.1.50"));
+            await using var d = new WifiDiscovery(t, s, null, new FakeTimeProvider());
+            t.Deliver(FullAnswer(ip: "192.168.1.50"));
+            t.Deliver(FullAnswer(id: "00000000", ip: "192.168.1.51", host: "other.local"));
+            var got = await Take(d.BrowseAsync(), 2);
+            Assert.Equal(DiscoverySource.LastKnown, got[0].Source);
+            Assert.Equal("192.168.1.51", got[1].Address.ToString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_BrowseIsSingleConsumer()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, new FakeTimeProvider());
+            using var cts = new CancellationTokenSource();
+            var e1 = d.BrowseAsync(cts.Token).GetAsyncEnumerator(cts.Token);
+            var pending = e1.MoveNextAsync().AsTask();
+            await t.SentSignal.WaitAsync(TimeSpan.FromSeconds(10));
+
+            await using var e2 = d.BrowseAsync().GetAsyncEnumerator();
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await e2.MoveNextAsync());
+
+            cts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+            await e1.DisposeAsync();
+
+            t.Deliver(FullAnswer());                                          // the guard is released again
+            var got = await Take(d.BrowseAsync(), 1);
+            Assert.Single(got);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void Settings_UnreadableFileIsNotOverwritten()
+    {
+        var dir = TempDir();
+        try
+        {
+            var path = Path.Combine(dir, "settings.json");
+            File.WriteAllText(path, "{\"other\":1,\"lastPhoneIp\":\"10.0.0.2\"}");
+            var s = new SettingsStore(path);
+            using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                Assert.Null(s.LastPhoneIp);
+                Assert.ThrowsAny<IOException>(() => s.SetLastPhoneIp(IPAddress.Parse("10.0.0.9")));
+            }
+            Assert.Equal("{\"other\":1,\"lastPhoneIp\":\"10.0.0.2\"}", File.ReadAllText(path));
+        }
+        finally { Directory.Delete(dir, true); }
     }
 
     [Fact]
