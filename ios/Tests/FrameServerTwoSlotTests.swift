@@ -190,4 +190,186 @@ final class FrameServerTwoSlotTests: XCTestCase {
         try waitUntil("both ended") { events.all.count == 2 }
         XCTAssertTrue(server.connectedKinds.isEmpty)
     }
+
+    // MARK: fix round 1
+
+    func testPreAuthOversizeAndWrongTypeClosedAtHeader() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let port = try start(server)
+        // HELLO announcing 4096 bytes (> 1024 pre-auth cap): closed from the header alone, payload never sent
+        let a = try XCTUnwrap(TestClient(port: port))
+        defer { a.close() }
+        XCTAssertEqual(a.readFrames(count: 1).first?.type, FrameType.hello.rawValue)
+        a.send(Data([0x01, 0x00, 0x00, 0x10, 0x00]))
+        XCTAssertTrue(a.readFrames(count: 1).isEmpty)
+        // a multi-MiB SEALED header before AUTH: wrong type for the phase, closed at the header
+        let b = try XCTUnwrap(TestClient(port: port))
+        defer { b.close() }
+        _ = b.readFrames(count: 1)
+        b.send(Data([0x09, 0x00, 0x30, 0x00, 0x00]))
+        XCTAssertTrue(b.readFrames(count: 1).isEmpty)
+        // AUTH before HELLO
+        let c = try XCTUnwrap(TestClient(port: port))
+        defer { c.close() }
+        _ = c.readFrames(count: 1)
+        c.send(FrameCodec.encode(.auth, Data(repeating: 1, count: 81)))
+        XCTAssertTrue(c.readFrames(count: 1).isEmpty)
+    }
+
+    func testWifiFloodCannotStarveUsb() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        server.authTimeout = 30
+        let port = try start(server)
+        server.testKindQueue = [.wifi, .wifi, .wifi, .wifi, .wifi]
+        server.testPeerIPQueue = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"]
+        var held = [TestClient]()
+        defer { held.forEach { $0.close() } }
+        for _ in 0..<FrameServer.maxUnauthenticatedWifi {
+            let c = try XCTUnwrap(TestClient(port: port))
+            held.append(c)
+            XCTAssertEqual(c.readFrames(count: 1).first?.type, FrameType.hello.rawValue)
+        }
+        // the wifi cap is full: the next network peer is closed without a HELLO
+        let over = try XCTUnwrap(TestClient(port: port))
+        defer { over.close() }
+        XCTAssertTrue(over.readFrames(count: 1).isEmpty)
+        // a USB (loopback) connection still gets served and authenticates
+        let usb = try AuthedClient.connect(port: port, initiator: fx.initiator())
+        defer { usb.close() }
+        XCTAssertEqual(server.connectedKinds, [.usb])
+    }
+
+    func testPerSourceIPCap() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        server.authTimeout = 30
+        let port = try start(server)
+        server.testKindQueue = [.wifi, .wifi, .wifi, .wifi]
+        server.testPeerIPQueue = ["10.0.0.9", "10.0.0.9", "10.0.0.9", "10.0.0.8"]
+        var held = [TestClient]()
+        defer { held.forEach { $0.close() } }
+        for _ in 0..<FrameServer.maxUnauthenticatedWifiPerIP {
+            let c = try XCTUnwrap(TestClient(port: port))
+            held.append(c)
+            XCTAssertEqual(c.readFrames(count: 1).first?.type, FrameType.hello.rawValue)
+        }
+        let third = try XCTUnwrap(TestClient(port: port))
+        defer { third.close() }
+        XCTAssertTrue(third.readFrames(count: 1).isEmpty)       // same IP: over its cap
+        let other = try XCTUnwrap(TestClient(port: port))
+        held.append(other)
+        XCTAssertEqual(other.readFrames(count: 1).first?.type, FrameType.hello.rawValue) // other IP is fine
+    }
+
+    func testSameKindReplacementOnlyAfterAuth() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let port = try start(server)
+        let a = try AuthedClient.connect(port: port, initiator: fx.initiator())
+        defer { a.close() }
+        let b = try AuthedClient.connect(port: port, initiator: fx.initiator())
+        defer { b.close() }
+        // A was replaced (its socket is closed); B is the live usb session
+        a.raw.setTimeout(3)
+        XCTAssertTrue(a.raw.readFrames(count: 1).isEmpty)
+        try b.sendInner(.ping, Data([0, 0, 0, 0, 0, 0, 0, 1]))
+        XCTAssertEqual(b.readInner(count: 1).first?.type, FrameType.pong.rawValue)
+        XCTAssertEqual(server.connectedKinds, [.usb])
+    }
+
+    func testUnknownStaticKeyAndWrongPcIdRejected() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let port = try start(server)
+        // mode 1 with an unknown S_I
+        let stranger = TestInitiator(sI: Curve25519.KeyAgreement.PrivateKey(), pcId: fx.pcId,
+                                     pairedPhonePub: fx.phonePub, token: nil)
+        XCTAssertThrowsError(try AuthedClient.connect(port: port, initiator: stranger))
+        // mode 1 with the right key but a different pcId
+        let wrongId = TestInitiator(sI: fx.pcKey, pcId: Data(repeating: 9, count: 16), pairedPhonePub: fx.phonePub, token: nil)
+        XCTAssertThrowsError(try AuthedClient.connect(port: port, initiator: wrongId))
+        XCTAssertTrue(server.connectedKinds.isEmpty)
+        // the genuine PC still gets in
+        let ok = try AuthedClient.connect(port: port, initiator: fx.initiator())
+        ok.close()
+    }
+
+    func testPairingWithWrongPcIdRefusedAndTokenKept() throws {
+        let fx = try Fixture(paired: false)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let port = try start(server)
+        let tokenBytes = Data(repeating: 0xB1, count: 16)
+        try fx.store.beginPairing(PairingToken(token: tokenBytes, pcId: fx.pcId, pcPub: fx.pcKey.publicKey.rawRepresentation,
+                                               name: "Desk PC", expiresAt: Date().addingTimeInterval(300)))
+        let bad = TestInitiator(sI: fx.pcKey, pcId: Data(repeating: 9, count: 16), pairedPhonePub: nil, token: tokenBytes)
+        XCTAssertThrowsError(try AuthedClient.connect(port: port, initiator: bad))
+        XCTAssertNotNil(fx.store.pendingToken)
+        XCTAssertNil(fx.store.paired)
+    }
+
+    func testSealedCounterReplayClosesSession() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let events = EventLog()
+        server.onSessionEnded = { gen, _ in events.add("e\(gen)") }
+        let port = try start(server)
+        let a = try AuthedClient.connect(port: port, initiator: fx.initiator())
+        defer { a.close() }
+        let payload = try a.channel.seal(innerType: FrameType.ping.rawValue, payload: Data([0, 0, 0, 0, 0, 0, 0, 7]))
+        let frame = FrameCodec.encode(.sealed, payload)
+        a.raw.send(frame)
+        XCTAssertEqual(a.readInner(count: 1).first?.type, FrameType.pong.rawValue)
+        a.raw.send(frame) // replayed counter
+        XCTAssertTrue(a.raw.readFrames(count: 1).isEmpty)
+        try waitUntil("session ended") { events.all == ["e1"] }
+    }
+
+    func testPhoneToPcFrameTypesFromPcCloseSession() throws {
+        let fx = try Fixture(paired: true)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let port = try start(server)
+        for t in [FrameType.video, .telemetry, .log] {
+            let a = try AuthedClient.connect(port: port, initiator: fx.initiator())
+            defer { a.close() }
+            try a.sendInner(t, Data([1, 2, 3]))
+            a.raw.setTimeout(3)
+            XCTAssertTrue(a.raw.readFrames(count: 1).isEmpty, "type \(t)")
+        }
+    }
+
+    func testConcurrentPairingHandshakesOneToken() throws {
+        let fx = try Fixture(paired: false)
+        let server = FrameServer(port: 0, authority: fx.store)
+        let port = try start(server)
+        let tokenBytes = Data(repeating: 0xB1, count: 16)
+        try fx.store.beginPairing(PairingToken(token: tokenBytes, pcId: fx.pcId, pcPub: fx.pcKey.publicKey.rawRepresentation,
+                                               name: "Desk PC", expiresAt: Date().addingTimeInterval(300)))
+        let i1 = TestInitiator(sI: fx.pcKey, pcId: fx.pcId, pairedPhonePub: nil, token: tokenBytes)
+        let i2 = TestInitiator(sI: fx.pcKey, pcId: fx.pcId, pairedPhonePub: nil, token: tokenBytes)
+
+        let r1 = try XCTUnwrap(TestClient(port: port))
+        defer { r1.close() }
+        r1.send(AuthedClient.helloPC)
+        _ = r1.readFrames(count: 1)
+        r1.send(FrameCodec.encode(.auth, i1.createAuth1()))
+        let auth2 = r1.readFrames(count: 1)
+        XCTAssertEqual(auth2.first?.type, FrameType.auth.rawValue) // first claim is in flight
+
+        let r2 = try XCTUnwrap(TestClient(port: port))
+        defer { r2.close() }
+        r2.send(AuthedClient.helloPC)
+        _ = r2.readFrames(count: 1)
+        r2.send(FrameCodec.encode(.auth, i2.createAuth1()))
+        XCTAssertTrue(r2.readFrames(count: 1).isEmpty)               // second claim refused
+
+        // the first handshake can still finish
+        _ = try i1.readAuth2(try XCTUnwrap(auth2.first).payload)
+        r1.send(FrameCodec.encode(.auth, try i1.createAuth3()))
+        let ch = SealedChannel(keys: try XCTUnwrap(i1.keys), role: .initiator)
+        let first = r1.readFrames(count: 1)
+        XCTAssertEqual(try ch.open(try XCTUnwrap(first.first).payload).type, FrameType.info.rawValue)
+        XCTAssertNotNil(fx.store.paired)
+    }
 }

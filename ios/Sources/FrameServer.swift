@@ -22,7 +22,10 @@ enum LinkKind: String, CaseIterable {
 /// stale events.
 final class FrameServer {
     static let maxPendingVideo = 3
-    static let maxUnauthenticated = 8
+    /// Unauthenticated connection caps, per kind so network peers can never starve USB.
+    static let maxUnauthenticatedWifi = 4
+    static let maxUnauthenticatedWifiPerIP = 2
+    static let maxUnauthenticatedUsb = 4
 
     var onListening: (() -> Void)?
     var onError: ((String) -> Void)?
@@ -44,7 +47,11 @@ final class FrameServer {
     var infoPayload = Hello.info(version: "1.0.0", device: "iPhone", os: "iOS")
     /// Test seam: kinds to assign to the next accepted connections (consumed in order) instead of
     /// classifying the peer address. Lets a loopback test connection play a network peer.
+#if DEBUG
     var testKindQueue = [LinkKind]()
+    /// Test seam: source IP strings for the next accepted connections (per-IP cap tests).
+    var testPeerIPQueue = [String]()
+#endif
 
     private let port: UInt16
     private let authority: ServerAuthority
@@ -57,7 +64,8 @@ final class FrameServer {
     private var backoff = 0.5
     private var generation: UInt64 = 0
     private var slots = [LinkKind: Conn]()
-    private var unauthenticated = 0
+    private var unauthByKind = [LinkKind: Int]()
+    private var unauthByIP = [String: Int]()
     private var droppedSinceLog = 0
     private var lastDropLog = Date.distantPast
     private var boundPortValue: UInt16 = 0
@@ -73,7 +81,17 @@ final class FrameServer {
         var channel: SealedChannel?
         var pendingVideo = 0
         var routeOverride: Bool?
-        init(fd: Int32, id: UInt64, kind: LinkKind) { self.fd = fd; self.id = id; self.kind = kind }
+        let ip: String
+        init(fd: Int32, id: UInt64, kind: LinkKind, ip: String) { self.fd = fd; self.id = id; self.kind = kind; self.ip = ip }
+    }
+
+    /// Releases the unauthenticated-connection accounting of `c`. Caller holds `lock`.
+    private func releaseUnauthLocked(_ c: Conn) {
+        unauthByKind[c.kind, default: 1] -= 1
+        if c.kind == .wifi {
+            let n = (unauthByIP[c.ip] ?? 1) - 1
+            unauthByIP[c.ip] = n > 0 ? n : nil
+        }
     }
 
     init(port: UInt16 = 47820, authority: ServerAuthority) {
@@ -202,7 +220,12 @@ final class FrameServer {
     private func admit(_ client: Int32) {
         let peer = Self.classifyPeer(client)
         lock.lock()
-        let kind: LinkKind = testKindQueue.isEmpty ? (peer.allowed ? .usb : .wifi) : testKindQueue.removeFirst()
+        var kind: LinkKind = peer.allowed ? .usb : .wifi
+        var ip = peer.description
+#if DEBUG
+        if !testKindQueue.isEmpty { kind = testKindQueue.removeFirst() }
+        if !testPeerIPQueue.isEmpty { ip = testPeerIPQueue.removeFirst() }
+#endif
         lock.unlock()
 
         // Nothing paired and no token pending: network peers get nothing at all.
@@ -220,10 +243,14 @@ final class FrameServer {
         setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         lock.lock()
-        if unauthenticated >= Self.maxUnauthenticated { lock.unlock(); close(client); return }
-        unauthenticated += 1
+        let kindCap = kind == .wifi ? Self.maxUnauthenticatedWifi : Self.maxUnauthenticatedUsb
+        let overKind = (unauthByKind[kind] ?? 0) >= kindCap
+        let overIP = kind == .wifi && (unauthByIP[ip] ?? 0) >= Self.maxUnauthenticatedWifiPerIP
+        if overKind || overIP { lock.unlock(); close(client); return }
+        unauthByKind[kind, default: 0] += 1
+        if kind == .wifi { unauthByIP[ip, default: 0] += 1 }
         generation += 1
-        let conn = Conn(fd: client, id: generation, kind: kind)
+        let conn = Conn(fd: client, id: generation, kind: kind, ip: ip)
         all[conn.id] = conn
         lock.unlock()
 
@@ -364,10 +391,27 @@ final class FrameServer {
 
     private enum Phase { case awaitHello, awaitAuth1, awaitAuth3, sealed }
 
+    /// Pre-auth frames are tiny (HELLO < 64 B, AUTH <= 97 B): cap them well below the 4 MiB session limit.
+    static let preAuthMaxPayload = 1024
+    /// Inner frame types a PC may send to the phone (anything else, e.g. VIDEO/TELEMETRY/LOG, ends the session).
+    static let pcInnerTypes: Set<UInt8> = [FrameType.cmd.rawValue, FrameType.ping.rawValue, FrameType.info.rawValue]
+
+    private func applyPolicy(_ d: inout FrameDecoder, _ phase: Phase) {
+        switch phase {
+        case .awaitHello:
+            d.maxPayload = Self.preAuthMaxPayload; d.allowedTypes = [FrameType.hello.rawValue]
+        case .awaitAuth1, .awaitAuth3:
+            d.maxPayload = Self.preAuthMaxPayload; d.allowedTypes = [FrameType.auth.rawValue]
+        case .sealed:
+            d.maxPayload = FrameCodec.maxPayload; d.allowedTypes = [FrameType.sealed.rawValue]
+        }
+    }
+
     private func readLoop(_ c: Conn) {
         var decoder = FrameDecoder()
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         var phase = Phase.awaitHello
+        applyPolicy(&decoder, phase)
         var responder: ResponderHandshake?
         var channel: SealedChannel?
 
@@ -378,49 +422,54 @@ final class FrameServer {
                 break
             }
             if n == 0 { break }
-            let frames: [Frame]
-            do { frames = try decoder.feed(Data(buffer[0..<n])) } catch {
-                onLog?("E protocol error: \(error)")
-                break
-            }
-            for frame in frames {
+            decoder.append(Data(buffer[0..<n]))
+            // one frame at a time: the policy tightens/relaxes between frames of the same chunk, and a
+            // disallowed type or oversize length is rejected at the header, before the payload is buffered
+            while true {
+                let next: Frame?
+                do { next = try decoder.nextFrame() } catch {
+                    onLog?("W protocol violation, closing connection")
+                    break outer
+                }
+                guard let frame = next else { break }
                 switch phase {
                 case .awaitHello:
-                    guard frame.type == FrameType.hello.rawValue, let h = try? Hello.parse(frame.payload),
-                          h.proto == Hello.protocolVersion, h.role == "pc" else {
-                        onLog?("W unsupported or out-of-order HELLO, closing")
+                    guard let h = try? Hello.parse(frame.payload), h.proto == Hello.protocolVersion, h.role == "pc" else {
+                        onLog?("W unsupported HELLO, closing")
                         break outer
                     }
                     phase = .awaitAuth1
                 case .awaitAuth1:
-                    guard frame.type == FrameType.auth.rawValue, let r = authority.makeResponder() else { break outer }
+                    guard let r = authority.makeResponder() else { break outer }
                     responder = r
                     guard let auth2 = try? r.readAuth1AndCreateAuth2(frame.payload) else { break outer }
                     sendPlain(c, .auth, auth2)
                     phase = .awaitAuth3
                 case .awaitAuth3:
-                    guard frame.type == FrameType.auth.rawValue, let r = responder,
-                          (try? r.readAuth3(frame.payload)) != nil, let result = r.result else { break outer }
+                    guard let r = responder, (try? r.readAuth3(frame.payload)) != nil, let result = r.result else { break outer }
                     let ch = SealedChannel(keys: result.keys, role: .responder)
                     guard promote(c, channel: ch) else { break outer }
                     channel = ch
                     responder = nil
                     phase = .sealed
                 case .sealed:
-                    guard frame.type == FrameType.sealed.rawValue, let ch = channel,
-                          let inner = try? ch.open(frame.payload) else {
+                    guard let ch = channel, let inner = try? ch.open(frame.payload) else {
                         onLog?("W sealed frame rejected, closing session")
                         break outer
                     }
-                    if answerPings && inner.type == FrameType.ping.rawValue {
-                        let recv = PhoneClock.nowUs()
-                        if let sent = Payloads.parsePing(inner.payload) {
-                            enqueue(c, FrameType.pong.rawValue, Payloads.pong(pcSendUs: sent, phoneRecvUs: recv))
+                    guard Self.pcInnerTypes.contains(inner.type) else {
+                        onLog?("W PC sent a phone-to-PC frame type, closing session")
+                        break outer
+                    }
+                    if inner.type == FrameType.ping.rawValue {
+                        if answerPings, let sent = Payloads.parsePing(inner.payload) {
+                            enqueue(c, FrameType.pong.rawValue, Payloads.pong(pcSendUs: sent, phoneRecvUs: PhoneClock.nowUs()))
                         }
                         continue
                     }
                     onFrame?(c.id, c.kind, inner)
                 }
+                applyPolicy(&decoder, phase)
             }
         }
 
@@ -429,7 +478,7 @@ final class FrameServer {
         let wasLive = c.authenticated && !c.retired
         c.retired = true
         if slots[c.kind] === c { slots[c.kind] = nil }
-        if !c.authenticated { unauthenticated -= 1 }
+        if !c.authenticated { releaseUnauthLocked(c) }
         all[c.id] = nil
         lock.unlock()
         // Close on the write queue: earlier queued writes finish first and later ones see a retired connection.
@@ -450,7 +499,7 @@ final class FrameServer {
         if c.retired { lock.unlock(); return false }
         c.channel = channel
         c.authenticated = true
-        unauthenticated -= 1
+        releaseUnauthLocked(c)
         let info = infoPayload
         // INFO is enqueued while holding the lock, before any other sender can see this connection
         writeQueue.async { [weak self] in self?.writeSealed(c, type: FrameType.info.rawValue, payload: info) }

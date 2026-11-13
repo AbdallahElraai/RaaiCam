@@ -17,6 +17,7 @@ final class ResponderHandshake {
     private let eR: Curve25519.KeyAgreement.PrivateKey
     private let isPairedPc: (Data) -> Bool
     private let tokenCheck: PairingTokenCheck?
+    private let expectedPairedPcId: Data?
     private var state = State.new
     private var claimedToken = false
     private var wasPairing = false
@@ -29,7 +30,9 @@ final class ResponderHandshake {
 
     /// `ephemeral` is a test seam (fixed vectors); production passes nil for a fresh key.
     init(phoneStatic: Curve25519.KeyAgreement.PrivateKey, isPairedPc: @escaping (Data) -> Bool,
-         tokenCheck: PairingTokenCheck?, ephemeral: Curve25519.KeyAgreement.PrivateKey? = nil) {
+         tokenCheck: PairingTokenCheck?, expectedPairedPcId: Data? = nil,
+         ephemeral: Curve25519.KeyAgreement.PrivateKey? = nil) {
+        self.expectedPairedPcId = expectedPairedPcId
         self.sR = phoneStatic
         self.isPairedPc = isPairedPc
         self.tokenCheck = tokenCheck
@@ -53,11 +56,12 @@ final class ResponderHandshake {
             if pairing {
                 guard let tc = tokenCheck,
                       tc.verifyHmac(ePub: eI, sPub: sI, presented: auth1.sub(81..<97)),
-                      tc.tryBegin(sIPub: sI) else { throw CryptoProtocolError.failed }
+                      tc.tryBegin(sIPub: sI, pcId: id) else { throw CryptoProtocolError.failed }
                 claimedToken = true
                 psk = tc.token
             } else {
                 guard isPairedPc(sI) else { throw CryptoProtocolError.failed }
+                if let want = expectedPairedPcId, !Kdf.constantTimeEqual(want, id) { throw CryptoProtocolError.failed }
             }
 
             let ePub = eR.publicKey.rawRepresentation

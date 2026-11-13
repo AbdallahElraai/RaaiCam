@@ -19,6 +19,7 @@ final class PairingTokenCheck {
     private let tokenBytes: Data
     private let expiresAt: Date
     private let expectedPcPub: Data
+    private let expectedPcId: Data?
     private let markUsed: () -> Bool
     private let now: () -> Date
     private let lock = NSLock()
@@ -26,11 +27,12 @@ final class PairingTokenCheck {
     private var inFlight = false
     private var consuming = false
 
-    init(token: Data, expiresAt: Date, expectedPcPub: Data, markUsed: @escaping () -> Bool,
+    init(token: Data, expiresAt: Date, expectedPcPub: Data, expectedPcId: Data? = nil, markUsed: @escaping () -> Bool,
          now: @escaping () -> Date = Date.init) {
         self.tokenBytes = token
         self.expiresAt = expiresAt
         self.expectedPcPub = expectedPcPub
+        self.expectedPcId = expectedPcId
         self.markUsed = markUsed
         self.now = now
     }
@@ -48,11 +50,12 @@ final class PairingTokenCheck {
     }
 
     /// Claims the token for one handshake. False if used, already claimed, expired or `S_I.pub` != QR `pk`.
-    func tryBegin(sIPub: Data) -> Bool {
+    func tryBegin(sIPub: Data, pcId: Data) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if used || inFlight { return false }
         if now() >= expiresAt { return false }
         if !Kdf.constantTimeEqual(expectedPcPub, sIPub) { return false }
+        if let id = expectedPcId, !Kdf.constantTimeEqual(id, pcId) { return false }
         inFlight = true
         return true
     }

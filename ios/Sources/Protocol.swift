@@ -8,6 +8,7 @@ enum FrameType: UInt8 {
 
 enum ProtocolError: Error, Equatable {
     case oversize(Int)
+    case disallowedType(UInt8)
     case badJSON
     case badProto(Int)
 }
@@ -37,20 +38,31 @@ enum FrameCodec {
 /// as soon as the 5-byte header is complete (before any payload is buffered).
 struct FrameDecoder {
     private var buf = [UInt8]()
+    /// Per-phase policy, checked at the 5-byte header before any payload is buffered.
+    var maxPayload = FrameCodec.maxPayload
+    /// nil = any type; otherwise a header with another type throws immediately.
+    var allowedTypes: Set<UInt8>?
+
+    mutating func append(_ data: Data) { buf.append(contentsOf: data) }
+
+    /// Next complete frame, or nil when more bytes are needed. Applies the current policy, so the caller
+    /// can tighten or relax it between frames of the same read chunk.
+    mutating func nextFrame() throws -> Frame? {
+        guard buf.count >= 5 else { return nil }
+        let type = buf[0]
+        let len = Int(buf[1]) << 24 | Int(buf[2]) << 16 | Int(buf[3]) << 8 | Int(buf[4])
+        if let allowed = allowedTypes, !allowed.contains(type) { throw ProtocolError.disallowedType(type) }
+        if len > maxPayload { throw ProtocolError.oversize(len) }
+        if buf.count - 5 < len { return nil }
+        let frame = Frame(type: type, payload: Data(buf[5..<(5 + len)]))
+        buf.removeFirst(5 + len)
+        return frame
+    }
 
     mutating func feed(_ data: Data) throws -> [Frame] {
-        buf.append(contentsOf: data)
+        append(data)
         var out = [Frame]()
-        var pos = 0
-        while buf.count - pos >= 5 {
-            let len = Int(buf[pos + 1]) << 24 | Int(buf[pos + 2]) << 16 | Int(buf[pos + 3]) << 8 | Int(buf[pos + 4])
-            if len > FrameCodec.maxPayload { throw ProtocolError.oversize(len) }
-            if buf.count - pos - 5 < len { break }
-            let start = pos + 5
-            out.append(Frame(type: buf[pos], payload: Data(buf[start..<(start + len)])))
-            pos = start + len
-        }
-        if pos > 0 { buf.removeFirst(pos) }
+        while let f = try nextFrame() { out.append(f) }
         return out
     }
 }

@@ -9,19 +9,35 @@ struct PairedPC: Equatable, Codable {
     var label: String
 }
 
+enum SecretStoreError: Error { case failed(Int32) }
+
 /// Secret storage seam (Keychain in the app, memory in tests).
 protocol SecretStore: AnyObject {
-    func get(_ account: String) -> Data?
+    /// nil = the item does not exist; throws on any other failure (never treat that as "absent").
+    func get(_ account: String) throws -> Data?
     @discardableResult func set(_ account: String, _ data: Data) -> Bool
-    func delete(_ account: String)
+    /// True if the item is gone afterwards (including "was not there").
+    @discardableResult func delete(_ account: String) -> Bool
 }
 
 final class MemorySecretStore: SecretStore {
     private let lock = NSLock()
     private var items = [String: Data]()
-    func get(_ account: String) -> Data? { lock.lock(); defer { lock.unlock() }; return items[account] }
+    /// Test hooks for Keychain failures.
+    var failReads = false
+    var failDeletes = false
+    func get(_ account: String) throws -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        if failReads { throw SecretStoreError.failed(-25308) }
+        return items[account]
+    }
     func set(_ account: String, _ data: Data) -> Bool { lock.lock(); items[account] = data; lock.unlock(); return true }
-    func delete(_ account: String) { lock.lock(); items[account] = nil; lock.unlock() }
+    func delete(_ account: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if failDeletes { return false }
+        items[account] = nil
+        return true
+    }
 }
 
 /// Generic-password Keychain items under one service, readable after the first unlock, never synced or migrated.
@@ -35,25 +51,32 @@ final class KeychainSecretStore: SecretStore {
          kSecAttrAccount as String: account]
     }
 
-    func get(_ account: String) -> Data? {
+    func get(_ account: String) throws -> Data? {
         var q = base(account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess else { return nil }
-        return out as? Data
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let d = out as? Data else { throw SecretStoreError.failed(status) }
+        return d
     }
 
     func set(_ account: String, _ data: Data) -> Bool {
-        SecItemDelete(base(account) as CFDictionary)
+        let update = SecItemUpdate(base(account) as CFDictionary,
+                                   [kSecValueData as String: data,
+                                    kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly] as CFDictionary)
+        if update == errSecSuccess { return true }
+        guard update == errSecItemNotFound else { return false }
         var q = base(account)
         q[kSecValueData as String] = data
         q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
     }
 
-    func delete(_ account: String) {
-        SecItemDelete(base(account) as CFDictionary)
+    func delete(_ account: String) -> Bool {
+        let status = SecItemDelete(base(account) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 
@@ -108,13 +131,31 @@ final class PairingStore: ServerAuthority {
 
     // MARK: state
 
+    /// Loads (and caches) the paired record. A Keychain error is thrown and never cached as "unpaired".
+    private func loadPairedLocked() throws -> PairedPC? {
+        if pairedLoaded { return cachedPaired }
+        do {
+            guard let d = try backing.get(Self.pairedAccount) else { pairedLoaded = true; cachedPaired = nil; return nil }
+            cachedPaired = try JSONDecoder().decode(PairedPC.self, from: d)
+            pairedLoaded = true
+            return cachedPaired
+        } catch { throw PairingStoreError.storage }
+    }
+
+    private func loadStaticLocked() throws -> Curve25519.KeyAgreement.PrivateKey? {
+        if staticLoaded { return cachedStatic }
+        do {
+            guard let d = try backing.get(Self.staticAccount) else { staticLoaded = true; cachedStatic = nil; return nil }
+            cachedStatic = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: d)
+            staticLoaded = true
+            return cachedStatic
+        } catch { throw PairingStoreError.storage }
+    }
+
+    /// The paired PC, or nil when unpaired or when the Keychain cannot be read right now.
     var paired: PairedPC? {
         lock.lock(); defer { lock.unlock() }
-        if !pairedLoaded {
-            pairedLoaded = true
-            if let d = backing.get(Self.pairedAccount) { cachedPaired = try? JSONDecoder().decode(PairedPC.self, from: d) }
-        }
-        return cachedPaired
+        return (try? loadPairedLocked()) ?? nil
     }
 
     /// The pending token, or nil when none or expired.
@@ -133,27 +174,21 @@ final class PairingStore: ServerAuthority {
 
     // MARK: static key
 
-    private func loadStaticLocked() -> Curve25519.KeyAgreement.PrivateKey? {
-        if !staticLoaded {
-            staticLoaded = true
-            if let d = backing.get(Self.staticAccount) { cachedStatic = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: d) }
-        }
-        return cachedStatic
-    }
-
-    /// The phone's long-term X25519 key, generated and persisted on first use.
+    /// The phone's long-term X25519 key, generated and persisted on first use. If the Keychain cannot be
+    /// read (anything other than "not found"), this throws instead of minting a replacement key.
     func staticKey() throws -> Curve25519.KeyAgreement.PrivateKey {
         lock.lock(); defer { lock.unlock() }
-        if let k = loadStaticLocked() { return k }
+        if let k = try loadStaticLocked() { return k }
         let k = Curve25519.KeyAgreement.PrivateKey()
         guard backing.set(Self.staticAccount, k.rawRepresentation) else { throw PairingStoreError.storage }
         cachedStatic = k
+        staticLoaded = true
         return k
     }
 
     func existingStaticPublic() -> Data? {
         lock.lock(); defer { lock.unlock() }
-        return loadStaticLocked()?.publicKey.rawRepresentation
+        return ((try? loadStaticLocked()) ?? nil)?.publicKey.rawRepresentation
     }
 
     // MARK: pairing lifecycle
@@ -164,7 +199,7 @@ final class PairingStore: ServerAuthority {
         lock.lock()
         nextPendingId += 1
         let id = nextPendingId
-        let check = PairingTokenCheck(token: token.token, expiresAt: token.expiresAt, expectedPcPub: token.pcPub,
+        let check = PairingTokenCheck(token: token.token, expiresAt: token.expiresAt, expectedPcPub: token.pcPub, expectedPcId: token.pcId,
                                       markUsed: { [weak self] in self?.completePairing(id: id) ?? false }, now: now)
         pending = Pending(id: id, token: token, check: check)
         lock.unlock()
@@ -211,16 +246,19 @@ final class PairingStore: ServerAuthority {
         notify()
     }
 
-    /// Wipes the pairing and the phone key from the Keychain and forgets any pending token.
-    func unpair() {
+    /// Wipes the pairing and the phone key from the Keychain and forgets any pending token. If a Keychain
+    /// delete fails the error is thrown, the in-memory state is dropped and the next access re-reads the
+    /// real Keychain contents (so state never claims more or less than what is stored).
+    func unpair() throws {
         lock.lock()
-        backing.delete(Self.pairedAccount)
-        backing.delete(Self.staticAccount)
-        cachedPaired = nil; pairedLoaded = true
-        cachedStatic = nil; staticLoaded = true
+        let a = backing.delete(Self.pairedAccount)
+        let b = backing.delete(Self.staticAccount)
+        pairedLoaded = false; cachedPaired = nil
+        staticLoaded = false; cachedStatic = nil
         pending = nil
         lock.unlock()
         notify()
+        if !(a && b) { throw PairingStoreError.storage }
     }
 
     // MARK: ServerAuthority
@@ -228,18 +266,14 @@ final class PairingStore: ServerAuthority {
     func makeResponder() -> ResponderHandshake? {
         lock.lock()
         let pend = livePendingLocked()
-        var pc: PairedPC?
-        if !pairedLoaded {
-            pairedLoaded = true
-            if let d = backing.get(Self.pairedAccount) { cachedPaired = try? JSONDecoder().decode(PairedPC.self, from: d) }
-        }
-        pc = cachedPaired
-        let key = loadStaticLocked()
+        let pcOpt = try? loadPairedLocked()
+        let keyOpt = try? loadStaticLocked()
         lock.unlock()
-        guard let sR = key, pc != nil || pend != nil else { return nil }
+        let pc: PairedPC? = pcOpt ?? nil
+        guard let sR = keyOpt ?? nil, pc != nil || pend != nil else { return nil }
         let pairedKey = pc?.pcPub
         return ResponderHandshake(phoneStatic: sR,
                                   isPairedPc: { peer in pairedKey.map { Kdf.constantTimeEqual(peer, $0) } ?? false },
-                                  tokenCheck: pend?.check)
+                                  tokenCheck: pend?.check, expectedPairedPcId: pc?.pcId)
     }
 }

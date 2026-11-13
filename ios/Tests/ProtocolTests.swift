@@ -47,6 +47,26 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try dec2.feed(Data([0x06, 0x00, 0x40, 0x00, 0x00])).count, 0)
     }
 
+    func testDecoderPolicyRejectsAtHeader() throws {
+        // pre-auth: 1024-byte cap and a type allow-list, both enforced on the 5-byte header alone
+        var dec = FrameDecoder()
+        dec.maxPayload = 1024
+        dec.allowedTypes = [FrameType.hello.rawValue]
+        dec.append(Data([0x01, 0x00, 0x00, 0x04, 0x01])) // HELLO announcing 1025 bytes
+        XCTAssertThrowsError(try dec.nextFrame()) { XCTAssertEqual($0 as? ProtocolError, .oversize(1025)) }
+        var dec2 = FrameDecoder()
+        dec2.allowedTypes = [FrameType.hello.rawValue]
+        dec2.append(Data([0x09, 0x00, 0x00, 0x00, 0x10])) // SEALED header, nothing buffered yet
+        XCTAssertThrowsError(try dec2.nextFrame()) { XCTAssertEqual($0 as? ProtocolError, .disallowedType(9)) }
+        // policy can change between frames of one chunk
+        var dec3 = FrameDecoder()
+        dec3.allowedTypes = [FrameType.hello.rawValue]
+        dec3.append(FrameCodec.encode(.hello, Data("{}".utf8)) + FrameCodec.encode(.auth, Data([1])))
+        XCTAssertEqual(try dec3.nextFrame()?.type, FrameType.hello.rawValue)
+        dec3.allowedTypes = [FrameType.auth.rawValue]
+        XCTAssertEqual(try dec3.nextFrame()?.type, FrameType.auth.rawValue)
+    }
+
     func testPartialFramesReassemble() throws {
         let vectors = try loadVectors()
         let v = try XCTUnwrap(vectors.first { $0.name == "video-keyframe" })

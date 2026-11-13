@@ -176,7 +176,7 @@ final class PhoneSession: ObservableObject {
         case .info:
             break // the PC's own INFO; nothing to do
         default:
-            log("W unexpected frame type \(frame.type)")
+            logThrottled("W unexpected frame type \(frame.type)")
         }
     }
 
@@ -186,7 +186,10 @@ final class PhoneSession: ObservableObject {
     }
 
     private func performUnpair() {
-        store.unpair()
+        do { try store.unpair() } catch {
+            log("E could not remove the pairing from the Keychain")
+            publish(detail: "Could not remove pairing data")
+        }
         server.closeAll()
         desired = nil
         stopStreaming()

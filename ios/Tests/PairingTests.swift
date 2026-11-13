@@ -68,7 +68,7 @@ final class PairingTests: XCTestCase {
 
         let notified = Counter()
         again.addObserver { notified.bump() }
-        again.unpair()
+        try again.unpair()
         XCTAssertNil(again.paired)
         XCTAssertNil(again.existingStaticPublic())
         XCTAssertNil(PairingStore(backing: mem).paired)
@@ -85,6 +85,43 @@ final class PairingTests: XCTestCase {
         XCTAssertNil(store.pendingToken)
         XCTAssertFalse(store.isPairedOrPending)
         XCTAssertNil(store.makeResponder())
+    }
+
+    func testNameStripsFormatCharacters() throws {
+        let now = Date()
+        // U+202E (bidi override, category Cf) and U+200B (zero-width space, Cf) must not survive
+        let t = try PairingURL.parse(url(name: "Desk%E2%80%AEPC%E2%80%8B1", exp: now.addingTimeInterval(300)), now: now).get()
+        XCTAssertEqual(t.name, "DeskPC1")
+    }
+
+    func testKeychainReadFailureIsNotUnpairedAndNeverMintsKey() throws {
+        let mem = MemorySecretStore()
+        let store = PairingStore(backing: mem)
+        let key = try store.staticKey().publicKey.rawRepresentation
+        try store.setPaired(PairedPC(pcId: pcId, pcPub: pcPub, label: "Desk PC"))
+
+        let fresh = PairingStore(backing: mem)
+        mem.failReads = true
+        XCTAssertThrowsError(try fresh.staticKey())          // must not generate a replacement key
+        XCTAssertNil(fresh.paired)                            // unreadable, not cached as "unpaired"
+        XCTAssertNil(fresh.makeResponder())
+        mem.failReads = false
+        XCTAssertEqual(fresh.paired?.label, "Desk PC")        // recovers once the Keychain is readable
+        XCTAssertEqual(try fresh.staticKey().publicKey.rawRepresentation, key)
+    }
+
+    func testUnpairFailureIsSurfaced() throws {
+        let mem = MemorySecretStore()
+        let store = PairingStore(backing: mem)
+        _ = try store.staticKey()
+        try store.setPaired(PairedPC(pcId: pcId, pcPub: pcPub, label: "Desk PC"))
+        mem.failDeletes = true
+        XCTAssertThrowsError(try store.unpair())
+        // state is re-read from the real store: still paired, consistent with what is persisted
+        XCTAssertNotNil(store.paired)
+        mem.failDeletes = false
+        try store.unpair()
+        XCTAssertNil(store.paired)
     }
 
     func testBonjourNameAndId() {

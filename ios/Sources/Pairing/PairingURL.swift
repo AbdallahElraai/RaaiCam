@@ -38,7 +38,10 @@ enum PairingURL {
 
         var name = (fields["name"] ?? "").replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? ""
         var scalars = String.UnicodeScalarView()
-        scalars.append(contentsOf: name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.prefix(64))
+        scalars.append(contentsOf: name.unicodeScalars.filter {
+            // drop control (Cc) and format (Cf, e.g. bidi overrides) characters
+            !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .format
+        }.prefix(64))
         name = String(scalars).trimmingCharacters(in: .whitespaces)
         if name.isEmpty { name = "your PC" }
 
