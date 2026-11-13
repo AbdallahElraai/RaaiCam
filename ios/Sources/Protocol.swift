@@ -1,9 +1,9 @@
 import Foundation
 
-// RaaiCam protocol v1 (see protocol/PROTOCOL.md). All integers big-endian.
+// RaaiCam protocol v2 (see protocol/PROTOCOL.md). All integers big-endian.
 
 enum FrameType: UInt8 {
-    case hello = 1, auth = 2, cmd = 3, telemetry = 4, log = 5, video = 6, ping = 7, pong = 8
+    case hello = 1, auth = 2, cmd = 3, telemetry = 4, log = 5, video = 6, ping = 7, pong = 8, sealed = 9, info = 10
 }
 
 enum ProtocolError: Error, Equatable {
@@ -108,6 +108,8 @@ enum Command: Equatable {
     case keyframe
     case bitrate(kbps: Int)
     case lens(Lens)
+    case route(video: Bool)
+    case unpair
     case unknown(String)
 
     static func parse(_ data: Data) throws -> Command {
@@ -127,15 +129,26 @@ enum Command: Equatable {
         case "lens":
             guard let l = (obj["lens"] as? String).flatMap(Lens.init(rawValue:)) else { throw ProtocolError.badJSON }
             return .lens(l)
+        case "route":
+            guard let v = obj["video"] as? Bool else { throw ProtocolError.badJSON }
+            return .route(video: v)
+        case "unpair": return .unpair
         default: return .unknown(name)
         }
     }
 }
 
 enum Hello {
-    static func phone(version: String, device: String, os: String) -> Data {
-        let obj: [String: Any] = ["proto": 1, "role": "phone", "app": "RaaiCam",
-                                  "version": version, "device": device, "os": os]
+    static let protocolVersion = 2
+
+    /// Plaintext HELLO: no device or OS names (they travel in the sealed INFO frame after AUTH).
+    static func phone() -> Data {
+        let obj: [String: Any] = ["proto": protocolVersion, "role": "phone"]
+        return (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
+    }
+
+    static func info(version: String, device: String, os: String) -> Data {
+        let obj: [String: Any] = ["app": "RaaiCam", "version": version, "device": device, "os": os]
         return (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
     }
 
@@ -169,11 +182,11 @@ struct TelemetrySnapshot: Equatable {
         }
     }
 
-    func jsonData() -> Data {
+    func jsonData(link: LinkKind = .usb) -> Data {
         let obj: [String: Any] = [
             "thermal": thermal, "battery": battery, "charging": charging, "streaming": streaming,
             "width": width, "height": height, "fpsCapture": fpsCapture, "fpsEncode": fpsEncode,
-            "bitrateKbps": bitrateKbps, "lens": lens.rawValue, "paused": paused,
+            "bitrateKbps": bitrateKbps, "lens": lens.rawValue, "paused": paused, "link": link.rawValue,
         ]
         return (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
     }

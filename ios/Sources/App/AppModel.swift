@@ -17,6 +17,7 @@ enum Screen: Equatable {
     case ready
     case streaming
     case warning(WarningKind)
+    case pairing
 }
 
 /// Brightness seam so the dimmer is testable without a real screen.
@@ -58,6 +59,11 @@ final class AppModel: ObservableObject {
     static let idleDimDelay: TimeInterval = 10
 
     let session: PhoneSession
+    let store: PairingStore
+    let pairing: PairingController
+    @Published private(set) var isPaired = false
+    @Published private(set) var links = Set<LinkKind>()
+    @Published private(set) var pairingActive = false
     @Published private(set) var state: SessionState = .waiting
     @Published private(set) var telemetry = TelemetrySnapshot()
     @Published private(set) var detail: String = ""
@@ -73,13 +79,26 @@ final class AppModel: ObservableObject {
     private var appActive = false
     private var bag = Set<AnyCancellable>()
 
-    init(session: PhoneSession = PhoneSession(), brightness: BrightnessControlling = ScreenBrightness()) {
-        self.session = session
+    init(store: PairingStore = PairingStore(), session: PhoneSession? = nil,
+         brightness: BrightnessControlling = ScreenBrightness()) {
+        self.store = store
+        self.session = session ?? PhoneSession(store: store)
+        let controller = PairingController(store: store)
+        self.pairing = controller
+        self.isPaired = store.paired != nil
+        self.pairingActive = controller.screenActive
         self.dimmer = Dimmer(control: brightness)
         self.hasUltraWide = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) != nil
-        session.$state.sink { [weak self] in self?.state = $0; self?.recompute() }.store(in: &bag)
-        session.$telemetry.sink { [weak self] in self?.telemetry = $0; self?.recompute() }.store(in: &bag)
-        session.$detail.sink { [weak self] in self?.detail = $0 }.store(in: &bag)
+        pairing.$phase.sink { [weak self] _ in
+            guard let self = self else { return }
+            self.isPaired = self.store.paired != nil
+            self.pairingActive = self.pairing.screenActive
+            self.recompute()
+        }.store(in: &bag)
+        self.session.$links.sink { [weak self] in self?.links = $0 }.store(in: &bag)
+        self.session.$state.sink { [weak self] in self?.state = $0; self?.recompute() }.store(in: &bag)
+        self.session.$telemetry.sink { [weak self] in self?.telemetry = $0; self?.recompute() }.store(in: &bag)
+        self.session.$detail.sink { [weak self] in self?.detail = $0 }.store(in: &bag)
         NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)
             .sink { [weak self] _ in self?.dimmer.restore() }.store(in: &bag)
         refreshAuthorization()
@@ -92,8 +111,10 @@ final class AppModel: ObservableObject {
     /// Precedence: camera permission denied > thermal critical > session error > thermal serious >
     /// (streaming only) not charging with battery under 30%. While streaming, serious thermal and the
     /// battery condition do not replace the Streaming screen; see `advisory(for:...)`.
-    static func screen(for state: SessionState, telemetry: TelemetrySnapshot, cameraAuthorized: Bool) -> Screen {
+    static func screen(for state: SessionState, telemetry: TelemetrySnapshot, cameraAuthorized: Bool,
+                       pairingActive: Bool = false) -> Screen {
         if !cameraAuthorized { return .warning(.cameraPermission) }
+        if pairingActive { return .pairing }
         if telemetry.thermal == "critical" { return .warning(.thermal(.critical)) }
         if case .error = state { return .warning(.disconnected) }
         let live = isStreaming(state)
@@ -120,7 +141,7 @@ final class AppModel: ObservableObject {
     }
 
     private func recompute() {
-        let s = Self.screen(for: state, telemetry: telemetry, cameraAuthorized: cameraAuthorized)
+        let s = Self.screen(for: state, telemetry: telemetry, cameraAuthorized: cameraAuthorized, pairingActive: pairingActive)
         let a = Self.advisory(for: state, telemetry: telemetry, cameraAuthorized: cameraAuthorized)
         if s != screen { screen = s }
         if a != advisory { advisory = a }
@@ -155,11 +176,13 @@ final class AppModel: ObservableObject {
 
     func tapped() {
         userTouched()
+        if screen == .pairing { return }
         showControls = true
     }
 
     func setPaused(_ paused: Bool) { session.setPaused(paused) }
     func switchLens(_ lens: Lens) { session.switchLens(lens) }
+    func unpair() { session.unpair() }
 
     func refreshAuthorization() {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -175,6 +198,7 @@ final class AppModel: ObservableObject {
         guard appActive, !showControls else { return false }
         switch screen {
         case .ready, .streaming: return true
+        case .pairing: return false
         case .warning: return false
         }
     }

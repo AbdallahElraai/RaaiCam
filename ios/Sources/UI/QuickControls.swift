@@ -3,6 +3,7 @@ import SwiftUI
 struct QuickControls: View {
     @ObservedObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmUnpair = false
 
     var body: some View {
         NavigationStack {
@@ -20,6 +21,11 @@ struct QuickControls: View {
                     }
                     .buttonStyle(.borderless)
                 }
+                if model.isPaired {
+                    Section {
+                        Button("Unpair this PC", role: .destructive) { confirmUnpair = true }
+                    }
+                }
                 if !model.detail.isEmpty {
                     Section("Diagnostics") {
                         Text(model.detail).font(.footnote).foregroundColor(.secondary)
@@ -36,6 +42,12 @@ struct QuickControls: View {
             }
         }
         .preferredColorScheme(.dark)
+        .alert("Unpair this PC?", isPresented: $confirmUnpair) {
+            Button("Unpair", role: .destructive) { dismiss(); model.unpair() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The PC will need to pair again with a new code.")
+        }
     }
 
     private func lensButton(_ title: String, _ lens: Lens, enabled: Bool) -> some View {

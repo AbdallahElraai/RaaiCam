@@ -18,6 +18,7 @@ struct ContentView: View {
             case .ready: ReadyView(model: model)
             case .streaming: StreamingView(model: model)
             case .warning(let kind): WarningView(kind: kind, model: model)
+            case .pairing: PairingView(model: model)
             }
         }
         .contentShape(Rectangle())

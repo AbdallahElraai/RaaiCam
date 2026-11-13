@@ -3,12 +3,8 @@ import SwiftUI
 struct ReadyView: View {
     @ObservedObject var model: AppModel
 
-    private var usbText: String {
-        switch model.state {
-        case .waiting: return "USB · waiting"
-        default: return "USB · connected"
-        }
-    }
+    private var usbText: String { model.links.contains(.usb) ? "USB · connected" : "USB · waiting" }
+    private var wifiText: String { model.links.contains(.wifi) ? "Wi-Fi · connected" : "Wi-Fi · waiting" }
 
     var body: some View {
         HStack(spacing: 32) {
@@ -36,6 +32,7 @@ struct ReadyView: View {
 
     @ViewBuilder private var pills: some View {
         Pill(systemImage: "cable.connector", text: usbText)
+        Pill(systemImage: "wifi", text: wifiText)
         Pill(systemImage: "battery.100", text: "\(Format.battery(model.telemetry)) · \(Format.thermal(model.telemetry.thermal))")
     }
 }

@@ -10,15 +10,19 @@ final class PhoneSession: ObservableObject {
     /// Extra human-readable context for `state` (e.g. a rejected non-loopback peer). Empty when none.
     @Published private(set) var detail: String = ""
     @Published private(set) var telemetry = TelemetrySnapshot()
+    /// Links with a live authenticated session.
+    @Published private(set) var links = Set<LinkKind>()
 
     private let work = DispatchQueue(label: "raaicam.session")
-    private let server = FrameServer()
+    private let store: PairingStore
+    private let server: FrameServer
     private let capture = CaptureController()
+    private let bonjour = BonjourPublisher()
 
     // work-queue state
     private var started = false
-    private var connected = false
-    private var currentGen: UInt64 = 0
+    private var sessions = [LinkKind: UInt64]()
+    private var connected: Bool { !sessions.isEmpty }
     private var paused = false
     private var desired: StartCommand?
     private var startToken: UInt64 = 0
@@ -42,7 +46,10 @@ final class PhoneSession: ObservableObject {
     private let logLock = NSLock()
     private var lastLogAt = [String: Date]()
 
-    init() {}
+    init(store: PairingStore = PairingStore()) {
+        self.store = store
+        self.server = FrameServer(authority: store)
+    }
 
     // MARK: public API
 
@@ -63,13 +70,16 @@ final class PhoneSession: ObservableObject {
                 self?.log("E server: \(msg)")
                 self?.work.async { self?.applyListenerEvent(.error(msg)) }
             }
-            server.onRejectedPeer = { [weak self] peer in
-                self?.log("W rejected non-loopback peer \(peer)")
-                self?.publish(detail: "Rejected non-loopback peer \(peer)")
+            server.onRejectedPeer = { [weak self] _ in
+                self?.log("W refused a network peer: not paired")
             }
-            server.onClientConnected = { [weak self] gen in self?.work.async { self?.clientConnected(gen) } }
-            server.onClientDisconnected = { [weak self] gen in self?.work.async { self?.clientDisconnected(gen) } }
-            server.onFrame = { [weak self] frame in self?.work.async { self?.handle(frame) } }
+            server.infoPayload = Hello.info(version: Self.appVersion, device: Self.deviceModel, os: Self.osString)
+            server.onSessionStarted = { [weak self] gen, kind in self?.work.async { self?.sessionStarted(gen, kind) } }
+            server.onSessionEnded = { [weak self] gen, kind in self?.work.async { self?.sessionEnded(gen, kind) } }
+            server.onFrame = { [weak self] gen, kind, frame in self?.work.async { self?.handle(frame, gen: gen, kind: kind) } }
+            server.onRoutingChanged = { [weak self] in self?.work.async { self?.routingChanged() } }
+            store.addObserver { [weak self] in self?.refreshBonjour() }
+            refreshBonjour()
             server.start()
         }
     }
@@ -111,22 +121,39 @@ final class PhoneSession: ObservableObject {
         if let s = Self.stateAfterListenerEvent(event, clientAttached: connected) { publish(state: s) }
     }
 
-    private func clientConnected(_ gen: UInt64) {
-        currentGen = gen
-        connected = true
-        stopStreaming()
-        desired = nil
-        server.send(.hello, Hello.phone(version: Self.appVersion, device: Self.deviceModel, os: Self.osString))
-        publish(state: .connected)
-        publish(detail: "")
-        startTelemetryTimer()
-        log("I client connected")
+    /// Bonjour follows the pairing state: advertise while paired or a token is pending, stop otherwise.
+    private func refreshBonjour() {
+        let pub: Data? = store.isPairedOrPending ? store.existingStaticPublic() : nil
+        DispatchQueue.main.async { [bonjour] in bonjour.update(staticPublic: pub) }
     }
 
-    private func clientDisconnected(_ gen: UInt64) {
-        // A disconnect from a client that was already replaced must not touch the live one.
-        guard gen == currentGen else { return }
-        connected = false
+    private func publishLinks() {
+        let set = Set(sessions.keys)
+        DispatchQueue.main.async { self.links = set }
+    }
+
+    /// A session finished AUTH. Capture state is shared by both links, so only the first session
+    /// (nothing attached before) resets it; a second link joining must not interrupt streaming.
+    private func sessionStarted(_ gen: UInt64, _ kind: LinkKind) {
+        let first = sessions.isEmpty
+        sessions[kind] = gen
+        if first {
+            stopStreaming()
+            desired = nil
+            publish(state: .connected)
+            publish(detail: "")
+            startTelemetryTimer()
+        }
+        publishLinks()
+        log("I \(kind.rawValue) session authenticated")
+    }
+
+    private func sessionEnded(_ gen: UInt64, _ kind: LinkKind) {
+        // An end from a session that was already replaced must not touch the live one.
+        guard sessions[kind] == gen else { return }
+        sessions[kind] = nil
+        publishLinks()
+        guard sessions.isEmpty else { return }
         desired = nil
         stopStreaming()
         telemetryTimer?.cancel()
@@ -135,24 +162,43 @@ final class PhoneSession: ObservableObject {
         publishTelemetry()
     }
 
-    private func handle(_ frame: Frame) {
+    /// The routed session may have changed: the new one needs a decodable start.
+    private func routingChanged() {
+        lock.lock(); let enc = encoder; lock.unlock()
+        enc?.forceKeyframe()
+    }
+
+    private func handle(_ frame: Frame, gen: UInt64, kind: LinkKind) {
         switch FrameType(rawValue: frame.type) {
-        case .hello:
-            if let h = try? Hello.parse(frame.payload), h.proto == 1 { return }
-            log("E bad HELLO, closing")
-            server.disconnectClient()
         case .cmd:
-            do { try handle(command: Command.parse(frame.payload)) }
+            do { try handle(command: Command.parse(frame.payload), gen: gen) }
             catch { log("W bad command payload") }
-        case .auth:
-            break // reserved for 1C
+        case .info:
+            break // the PC's own INFO; nothing to do
         default:
             log("W unexpected frame type \(frame.type)")
         }
     }
 
-    private func handle(command: Command) {
+    /// Wipes the pairing and the phone key, closes every session and returns to the pairing screen.
+    func unpair() {
+        work.async { [self] in performUnpair() }
+    }
+
+    private func performUnpair() {
+        store.unpair()
+        server.closeAll()
+        desired = nil
+        stopStreaming()
+    }
+
+    private func handle(command: Command, gen: UInt64) {
         switch command {
+        case .route(let video):
+            server.setRoute(gen: gen, video: video)
+        case .unpair:
+            log("I unpair requested")
+            performUnpair()
         case .start(let raw):
             let (cmd, warnings) = raw.sanitized()
             warnings.forEach { log($0) }
@@ -394,7 +440,7 @@ final class PhoneSession: ObservableObject {
         snapshot.battery = level < 0 ? 0 : Double(level)
         snapshot.charging = (chargeState == .charging || chargeState == .full)
         snapshot.paused = paused
-        if connected { server.send(.telemetry, snapshot.jsonData()) }
+        for kind in sessions.keys { server.send(.telemetry, snapshot.jsonData(link: kind), to: kind) }
         publishTelemetry()
     }
 
@@ -417,7 +463,7 @@ final class PhoneSession: ObservableObject {
     private func log(_ line: String) {
         let clean = line.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
         NSLog("RaaiCam %@", clean)
-        server.send(.log, Data(clean.utf8))
+        server.sendAll(.log, Data(clean.utf8))
     }
 
     /// For anything that can fire per frame: at most one identical-prefix line per 5 s.
