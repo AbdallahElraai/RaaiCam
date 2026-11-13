@@ -34,18 +34,21 @@ public sealed class WifiDiscovery : IAsyncDisposable
     readonly string? _expectedId;
     readonly TimeProvider _time;
     readonly ILogSink? _log;
+    readonly Func<IPAddress, bool> _isOnLink;
     int _disposed;
     int _browsing;
 
     /// <param name="expectedId">Only yield phones advertising this id; null yields every phone with a valid id.</param>
+    /// <param name="isOnLink">Test hook: whether a public-range address is inside a local interface subnet (default: cached interface prefixes).</param>
     public WifiDiscovery(IMdnsTransport transport, SettingsStore settings, string? expectedId = null,
-                         TimeProvider? time = null, ILogSink? log = null)
+                         TimeProvider? time = null, ILogSink? log = null, Func<IPAddress, bool>? isOnLink = null)
     {
         _transport = transport;
         _settings = settings;
         _expectedId = expectedId?.ToLowerInvariant();
         _time = time ?? TimeProvider.System;
         _log = log;
+        _isOnLink = isOnLink ?? OnLinkCache.Contains;
     }
 
     /// <summary>The Bonjour id for a phone static public key: lowercase hex of the first 4 bytes of SHA-256 (matches iOS <c>BonjourPublisher.idHex</c>).</summary>
@@ -72,14 +75,14 @@ public sealed class WifiDiscovery : IAsyncDisposable
             throw new InvalidOperationException("BrowseAsync is already running; it supports a single consumer.");
         try
         {
-            var seen = new HashSet<(string, IPAddress)>();
+            var seen = new SeenSet();
 
             IPAddress? last = _settings.LastPhoneIp;
             if (last is not null && IsUsable(last) && seen.Add((_expectedId ?? "", last)))
                 yield return new DiscoveredPhone(_expectedId ?? "", last, DefaultPort, DiscoverySource.LastKnown);
             else last = null;
 
-            var state = new BrowseState(_time, _expectedId);
+            var state = new BrowseState(_time, _expectedId, IsUsable);
             var channel = Channel.CreateUnbounded<DiscoveredPhone>();
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var tasks = new[]
@@ -125,7 +128,7 @@ public sealed class WifiDiscovery : IAsyncDisposable
         catch (OperationCanceledException) { }
     }
 
-    async Task ReceiveLoop(BrowseState state, HashSet<(string, IPAddress)> seen, IPAddress? lastKnown,
+    async Task ReceiveLoop(BrowseState state, SeenSet seen, IPAddress? lastKnown,
                            ChannelWriter<DiscoveredPhone> output, CancellationToken ct)
     {
         try
@@ -160,39 +163,14 @@ public sealed class WifiDiscovery : IAsyncDisposable
     }
 
     /// <summary>Only addresses a phone on our LAN can have: RFC 1918, link-local, or inside a local interface's subnet.</summary>
-    internal static bool IsUsable(IPAddress a)
+    bool IsUsable(IPAddress a)
     {
         if (a.AddressFamily != AddressFamily.InterNetwork) return false;
         var b = a.GetAddressBytes();
         if (b[0] == 10 || (b[0] == 172 && b[1] is >= 16 and <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254))
             return true;
         if (b[0] == 0 || b[0] == 127 || b[0] >= 224) return false;
-        return IsOnLink(a);
-    }
-
-    static bool IsOnLink(IPAddress a)
-    {
-        try
-        {
-            var target = a.GetAddressBytes();
-            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-            {
-                if (nic.OperationalStatus != OperationalStatus.Up || nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
-                {
-                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-                    int prefix = ua.PrefixLength;
-                    if (prefix < 8 || prefix > 32) continue; // a /0../7 "subnet" would make everything on-link
-                    var local = ua.Address.GetAddressBytes();
-                    bool same = true;
-                    for (int bit = 0; bit < prefix && same; bit++)
-                        same = ((local[bit / 8] ^ target[bit / 8]) & (0x80 >> (bit % 8))) == 0;
-                    if (same) return true;
-                }
-            }
-        }
-        catch (Exception) { }
-        return false;
+        return _isOnLink(a);
     }
 
     static bool IsIdHex(string s)
@@ -252,8 +230,15 @@ public sealed class WifiDiscovery : IAsyncDisposable
         readonly string? _expectedInstance;
         long _seq;
 
-        public BrowseState(TimeProvider time, string? expectedId)
+        // With an id filter, A records seen before the expected instance's SRV name its host are held here (first four
+        // names win, so junk arriving later cannot push the real phone's address out) and promoted once the SRV arrives.
+        readonly Dictionary<string, HostEntry> _pending = new(StringComparer.OrdinalIgnoreCase);
+        const int MaxPending = 4;
+        readonly Func<IPAddress, bool> _isUsable;
+
+        public BrowseState(TimeProvider time, string? expectedId, Func<IPAddress, bool> isUsable)
         {
+            _isUsable = isUsable;
             _time = time;
             _expectedId = expectedId;
             _expectedInstance = expectedId is null ? null : "RaaiCam-" + expectedId + InstanceSuffix;
@@ -282,7 +267,11 @@ public sealed class WifiDiscovery : IAsyncDisposable
                             break;
                         case MdnsRecordType.Srv when Admit(r.Name) && r.Port is > 0 and <= 65535
                                                    && r.Target is { } host && IsEncodableName(host):
-                            if (Touch(r.Name, r.Ttl, now) is { } s) { s.Host = host; s.Port = r.Port; }
+                            if (Touch(r.Name, r.Ttl, now) is { } s)
+                            {
+                                s.Host = host; s.Port = r.Port;
+                                PromotePending(host);
+                            }
                             break;
                         case MdnsRecordType.Txt when Admit(r.Name) && r.Txt is { } txt:
                             if (Touch(r.Name, r.Ttl, now) is { } x)
@@ -295,9 +284,28 @@ public sealed class WifiDiscovery : IAsyncDisposable
                 // Address records last, so the SRV in the same packet has already named the host we care about.
                 foreach (var r in records)
                 {
-                    if (r.Type != MdnsRecordType.A || r.Address is not { } a || !IsUsable(a) || !IsEncodableName(r.Name)) continue;
-                    if (_expectedInstance is not null && _instances.TryGetValue(_expectedInstance, out var inst)
-                        && inst.Host is not null && !inst.Host.Equals(r.Name, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (r.Type != MdnsRecordType.A || r.Address is not { } a || !_isUsable(a) || !IsEncodableName(r.Name)) continue;
+
+                    if (_expectedInstance is not null)
+                    {
+                        string? known = _instances.TryGetValue(_expectedInstance, out var inst) ? inst.Host : null;
+                        if (known is not null)
+                        {
+                            if (!known.Equals(r.Name, StringComparison.OrdinalIgnoreCase)) continue; // not the phone's host
+                        }
+                        else
+                        {
+                            // Host not named yet: park it in the small first-wins buffer instead of the shared table.
+                            if (r.Ttl == 0) continue;
+                            if (!_pending.TryGetValue(r.Name, out var p))
+                            {
+                                if (_pending.Count >= MaxPending) continue;
+                                _pending[r.Name] = p = new HostEntry();
+                            }
+                            if (p.Addrs.Count < MaxAddressesPerHost || p.Addrs.ContainsKey(a)) p.Addrs[a] = Deadline(now, r.Ttl);
+                            continue;
+                        }
+                    }
 
                     if (r.Ttl == 0)
                     {
@@ -307,11 +315,30 @@ public sealed class WifiDiscovery : IAsyncDisposable
                     if (!_hosts.TryGetValue(r.Name, out var h))
                     {
                         if (_hosts.Count >= MaxHosts) EvictOldest(_hosts, e => e.Seq);
-                        _hosts[r.Name] = h = new HostEntry { Seq = ++_seq };
+                        _hosts[r.Name] = h = new HostEntry();
                     }
+                    h.Seq = ++_seq; // last seen: every re-announcement refreshes it
                     if (h.Addrs.Count < MaxAddressesPerHost || h.Addrs.ContainsKey(a)) h.Addrs[a] = Deadline(now, r.Ttl);
                 }
             }
+        }
+
+        /// <summary>The expected instance just named its host: move its buffered addresses into the table, drop the rest.</summary>
+        void PromotePending(string host)
+        {
+            if (_expectedInstance is null) return;
+            if (_pending.TryGetValue(host, out var p) && p.Addrs.Count > 0)
+            {
+                if (!_hosts.TryGetValue(host, out var h))
+                {
+                    if (_hosts.Count >= MaxHosts) EvictOldest(_hosts, e => e.Seq);
+                    _hosts[host] = h = new HostEntry();
+                }
+                h.Seq = ++_seq;
+                foreach (var (addr, exp) in p.Addrs)
+                    if (h.Addrs.Count < MaxAddressesPerHost || h.Addrs.ContainsKey(addr)) h.Addrs[addr] = exp;
+            }
+            _pending.Clear();
         }
 
         /// <summary>Creates or refreshes an instance; TTL 0 (goodbye) removes it and returns null.</summary>
@@ -321,8 +348,9 @@ public sealed class WifiDiscovery : IAsyncDisposable
             if (!_instances.TryGetValue(name, out var i))
             {
                 if (_instances.Count >= MaxInstances) EvictOldest(_instances, e => e.Seq);
-                _instances[name] = i = new Instance { Seq = ++_seq };
+                _instances[name] = i = new Instance();
             }
+            i.Seq = ++_seq; // last seen: eviction removes the least recently seen entry
             i.Expires = Deadline(now, ttl);
             return i;
         }
@@ -337,6 +365,11 @@ public sealed class WifiDiscovery : IAsyncDisposable
         void Purge(long now)
         {
             foreach (var k in _instances.Where(kv => kv.Value.Expires <= now).Select(kv => kv.Key).ToList()) _instances.Remove(k);
+            foreach (var (k, h) in _pending.ToList())
+            {
+                foreach (var a in h.Addrs.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList()) h.Addrs.Remove(a);
+                if (h.Addrs.Count == 0) _pending.Remove(k);
+            }
             foreach (var (k, h) in _hosts.ToList())
             {
                 foreach (var a in h.Addrs.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList()) h.Addrs.Remove(a);
@@ -377,5 +410,78 @@ public sealed class WifiDiscovery : IAsyncDisposable
             }
             return qs;
         }
+    }
+}
+
+/// <summary>Local IPv4 subnets, enumerated once and refreshed when the machine's addresses change (not per record).</summary>
+static class OnLinkCache
+{
+    static readonly object Gate = new();
+    static (byte[] Addr, int Prefix)[]? _subnets;
+    static bool _subscribed;
+
+    public static bool Contains(IPAddress a)
+    {
+        if (a.AddressFamily != AddressFamily.InterNetwork) return false;
+        var subnets = Get();
+        var target = a.GetAddressBytes();
+        foreach (var (local, prefix) in subnets)
+        {
+            bool same = true;
+            for (int bit = 0; bit < prefix && same; bit++)
+                same = ((local[bit / 8] ^ target[bit / 8]) & (0x80 >> (bit % 8))) == 0;
+            if (same) return true;
+        }
+        return false;
+    }
+
+    static (byte[], int)[] Get()
+    {
+        lock (Gate)
+        {
+            if (!_subscribed)
+            {
+                _subscribed = true;
+                try { NetworkChange.NetworkAddressChanged += (_, _) => { lock (Gate) _subnets = null; }; } catch (Exception) { }
+            }
+            return _subnets ??= Enumerate();
+        }
+    }
+
+    static (byte[], int)[] Enumerate()
+    {
+        var list = new List<(byte[], int)>();
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up || nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                {
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    int prefix = ua.PrefixLength;
+                    if (prefix < 8 || prefix > 32) continue; // a /0../7 "subnet" would make everything on-link
+                    list.Add((ua.Address.GetAddressBytes(), prefix));
+                }
+            }
+        }
+        catch (Exception) { }
+        return list.ToArray();
+    }
+}
+
+/// <summary>Already-yielded (id, address) pairs, capped at 256 with FIFO eviction.</summary>
+sealed class SeenSet
+{
+    const int Max = 256;
+    readonly HashSet<(string, IPAddress)> _set = new();
+    readonly Queue<(string, IPAddress)> _order = new();
+
+    public bool Add((string, IPAddress) key)
+    {
+        if (!_set.Add(key)) return false;
+        _order.Enqueue(key);
+        while (_order.Count > Max) _set.Remove(_order.Dequeue());
+        return true;
     }
 }

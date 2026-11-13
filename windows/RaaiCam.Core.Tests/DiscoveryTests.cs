@@ -483,7 +483,7 @@ public class DiscoveryTests
             Assert.Equal("192.168.1.50", (await Next(e)).Address.ToString());
 
             t.Deliver(new DnsBuilder { Ttl = 0 }.Ptr(Svc, Inst).Srv(Inst, 47820, "phone.local").Txt(Inst, "v=2", "id=a1b2c3d4").Build());
-            t.Deliver(new DnsBuilder().A("phone.local", "192.168.1.55").Build());   // nothing refers to it any more
+            t.Deliver(new DnsBuilder().A("phone.local", "192.168.1.55").Build());   // the instance is gone: had the goodbye failed, this would be yielded (as .55) before .56
             t.Deliver(FullAnswer(ip: "192.168.1.56", host: "h2.local"));
             Assert.Equal("192.168.1.56", (await Next(e)).Address.ToString());
         }
@@ -591,6 +591,64 @@ public class DiscoveryTests
                 Assert.ThrowsAny<IOException>(() => s.SetLastPhoneIp(IPAddress.Parse("10.0.0.9")));
             }
             Assert.Equal("{\"other\":1,\"lastPhoneIp\":\"10.0.0.2\"}", File.ReadAllText(path));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    // ---- fix round 2 ----
+
+    [Fact]
+    public async Task Discovery_JunkAddressesBeforeSrvCannotDisplaceRealHost()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), "a1b2c3d4", new FakeTimeProvider());
+            t.Deliver(new DnsBuilder().A("real.local", "192.168.1.50").Build());
+            for (int i = 0; i < 40; i++) t.Deliver(new DnsBuilder().A($"junk{i}.local", "192.168.5.5").Build());
+            t.Deliver(new DnsBuilder().Ptr(Svc, Inst).Srv(Inst, 47820, "real.local").Txt(Inst, "v=2", "id=a1b2c3d4").Build());
+            var got = await Take(d.BrowseAsync(), 1);   // no time advance: no re-query happened
+            Assert.Equal("192.168.1.50", got[0].Address.ToString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_ReannouncedEntriesSurviveEviction()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, new FakeTimeProvider());
+            await using var e = d.BrowseAsync().GetAsyncEnumerator();
+            t.Deliver(FullAnswer(ip: "192.168.1.50"));
+            Assert.Equal("192.168.1.50", (await Next(e)).Address.ToString());
+
+            for (int i = 0; i < 20; i++) t.Deliver(new DnsBuilder().Ptr(Svc, $"Junk{i}._raaicam._tcp.local").Build());
+            t.Deliver(new DnsBuilder().Ptr(Svc, Inst).Srv(Inst, 47820, "phone.local").Txt(Inst, "v=2", "id=a1b2c3d4").Build()); // re-announce
+            for (int i = 20; i < 40; i++) t.Deliver(new DnsBuilder().Ptr(Svc, $"Junk{i}._raaicam._tcp.local").Build());
+
+            t.Deliver(new DnsBuilder().A("phone.local", "192.168.1.55").Build());   // only resolves if the real instance survived
+            Assert.Equal("192.168.1.55", (await Next(e)).Address.ToString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public async Task Discovery_OnLinkPredicateAdmitsNonPrivateAddress()
+    {
+        var t = new FakeMdnsTransport();
+        var dir = TempDir();
+        try
+        {
+            await using var d = new WifiDiscovery(t, new SettingsStore(Path.Combine(dir, "s.json")), null, new FakeTimeProvider(),
+                isOnLink: a => a.ToString().StartsWith("203.0.113."));
+            t.Deliver(FullAnswer(ip: "8.8.8.8", host: "off.local"));
+            t.Deliver(FullAnswer(ip: "203.0.113.7", host: "on.local"));
+            var got = await Take(d.BrowseAsync(), 1);
+            Assert.Equal("203.0.113.7", got[0].Address.ToString());
         }
         finally { Directory.Delete(dir, true); }
     }
